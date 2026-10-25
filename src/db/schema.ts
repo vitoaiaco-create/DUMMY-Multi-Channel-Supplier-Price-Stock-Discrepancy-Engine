@@ -1,4 +1,4 @@
-import { integer, jsonb, numeric, pgTable, text, timestamp, uuid, varchar } from "drizzle-orm/pg-core";
+import { boolean, integer, jsonb, numeric, pgTable, text, timestamp, uuid, varchar } from "drizzle-orm/pg-core";
 
 export const usersTable = pgTable("users", {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
@@ -9,13 +9,17 @@ export const usersTable = pgTable("users", {
 
 export const masterCatalog = pgTable("master_catalog", {
   id: uuid().primaryKey().defaultRandom(),
-  internalSku: text().unique().notNull(),
-  productName: text().notNull(),
-  category: text(),
-  benchmarkCost: numeric({ precision: 10, scale: 2 }).notNull(),
-  retailPrice: numeric({ precision: 10, scale: 2 }).notNull(),
+  internalSku: varchar({ length: 255 }).unique().notNull(),
+  productName: varchar({ length: 255 }).notNull(),
+  category: varchar({ length: 255 }),
+  targetCostUsd: numeric({ precision: 10, scale: 2 }).notNull(),
+  retailPriceUsd: numeric({ precision: 10, scale: 2 }).notNull(),
+  targetMarginPct: numeric({ precision: 5, scale: 2 }).notNull(),
   minMarginPct: numeric({ precision: 5, scale: 2 }).notNull(),
-  currentStock: integer().default(0),
+  primarySupplier: varchar({ length: 255 }),
+  currentWarehouseStock: integer().default(0),
+  scarcityPremiumActive: boolean().notNull().default(false),
+  scarcityReviewDate: timestamp(),
 });
 
 export const supplierFeeds = pgTable("supplier_feeds", {
@@ -47,7 +51,20 @@ export const supplierConfigs = pgTable("supplier_configs", {
   baseCurrency: text().notNull(),
   freightFactorPct: numeric({ precision: 5, scale: 2 }).notNull(),
   importDutyPct: numeric({ precision: 5, scale: 2 }).notNull(),
+  freightPct: numeric({ precision: 5, scale: 2 }),
+  dutyPct: numeric({ precision: 5, scale: 2 }),
   updatedAt: timestamp(),
+});
+
+export const overrideAuditLog = pgTable("override_audit_log", {
+  id: uuid().primaryKey().defaultRandom(),
+  supplierName: text().notNull(),
+  internalSku: text(),
+  changedField: text().notNull(),
+  oldValue: numeric({ precision: 10, scale: 4 }).notNull(),
+  newValue: numeric({ precision: 10, scale: 4 }).notNull(),
+  userId: text().notNull(),
+  createdAt: timestamp().defaultNow(),
 });
 
 export const supplierMappingTemplates = pgTable("supplier_mapping_templates", {

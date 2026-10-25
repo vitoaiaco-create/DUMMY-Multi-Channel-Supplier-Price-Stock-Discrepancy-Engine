@@ -21,6 +21,8 @@ async function seedFx() {
       baseCurrency: "USD",
       freightFactorPct: "15.00",
       importDutyPct: "15.00",
+      freightPct: "15.00",
+      dutyPct: "15.00",
       updatedAt: new Date(),
     },
     {
@@ -28,6 +30,8 @@ async function seedFx() {
       baseCurrency: "EUR",
       freightFactorPct: "12.00",
       importDutyPct: "15.00",
+      freightPct: "12.00",
+      dutyPct: "15.00",
       updatedAt: new Date(),
     },
     {
@@ -35,6 +39,8 @@ async function seedFx() {
       baseCurrency: "ZAR",
       freightFactorPct: "8.00",
       importDutyPct: "15.00",
+      freightPct: "8.00",
+      dutyPct: "15.00",
       updatedAt: new Date(),
     },
   ]);

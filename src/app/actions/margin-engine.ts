@@ -56,7 +56,7 @@ function parseApexFeedAlerts(
         if (!catalogItem) return;
 
         const fobCostUsd = parseNumber(row.Wholesale_Cost_USD);
-        const retailPriceUsd = parseNumber(catalogItem.retailPrice);
+        const retailPriceUsd = parseNumber(catalogItem.retailPriceUsd);
         const minMarginPct = parseNumber(catalogItem.minMarginPct);
 
         if (

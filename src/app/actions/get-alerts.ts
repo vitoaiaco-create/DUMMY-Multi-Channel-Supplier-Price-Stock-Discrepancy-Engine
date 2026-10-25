@@ -2,6 +2,7 @@
 
 import { asc, eq } from "drizzle-orm";
 
+import { getLatestSkuLogisticsOverrides } from "@/app/actions/overrides";
 import { db } from "@/db";
 import { marginAlerts, masterCatalog, supplierConfigs } from "@/db/schema";
 
@@ -19,6 +20,7 @@ export type MarginAlert = {
 
 export type CommandCenterSupplier = {
   supplierName: string;
+  supplierCode: string;
   fobPriceUsd: number;
   freightPct: number;
   dutyPct: number;
@@ -27,6 +29,15 @@ export type CommandCenterSupplier = {
 export type CommandCenterSku = {
   internalSku: string;
   productName: string;
+  category: string | null;
+  targetCostUsd: number;
+  retailPriceUsd: number;
+  targetMarginPct: number;
+  minMarginPct: number;
+  primarySupplier: string | null;
+  currentWarehouseStock: number;
+  scarcityPremiumActive: boolean;
+  scarcityReviewDate: string | null;
   suppliers: CommandCenterSupplier[];
 };
 
@@ -88,25 +99,39 @@ function toRateDecimal(value: string | number | null | undefined): number {
 }
 
 export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
-  const rows = await db
-    .select({
-      internalSku: masterCatalog.internalSku,
-      productName: masterCatalog.productName,
-      supplierCode: marginAlerts.supplierCode,
-      fobPriceUsd: marginAlerts.supplierFobCostUsd,
-      freightPct: supplierConfigs.freightFactorPct,
-      dutyPct: supplierConfigs.importDutyPct,
-    })
-    .from(masterCatalog)
-    .innerJoin(
-      marginAlerts,
-      eq(masterCatalog.internalSku, marginAlerts.internalSku),
-    )
-    .leftJoin(
-      supplierConfigs,
-      eq(marginAlerts.supplierCode, supplierConfigs.supplierCode),
-    )
-    .orderBy(asc(masterCatalog.internalSku));
+  const [rows, skuOverrides] = await Promise.all([
+    db
+      .select({
+        internalSku: masterCatalog.internalSku,
+        productName: masterCatalog.productName,
+        category: masterCatalog.category,
+        targetCostUsd: masterCatalog.targetCostUsd,
+        retailPriceUsd: masterCatalog.retailPriceUsd,
+        targetMarginPct: masterCatalog.targetMarginPct,
+        minMarginPct: masterCatalog.minMarginPct,
+        primarySupplier: masterCatalog.primarySupplier,
+        currentWarehouseStock: masterCatalog.currentWarehouseStock,
+        scarcityPremiumActive: masterCatalog.scarcityPremiumActive,
+        scarcityReviewDate: masterCatalog.scarcityReviewDate,
+        supplierCode: marginAlerts.supplierCode,
+        fobPriceUsd: marginAlerts.supplierFobCostUsd,
+        freightPct: supplierConfigs.freightPct,
+        dutyPct: supplierConfigs.dutyPct,
+        freightFactorPct: supplierConfigs.freightFactorPct,
+        importDutyPct: supplierConfigs.importDutyPct,
+      })
+      .from(masterCatalog)
+      .innerJoin(
+        marginAlerts,
+        eq(masterCatalog.internalSku, marginAlerts.internalSku),
+      )
+      .leftJoin(
+        supplierConfigs,
+        eq(marginAlerts.supplierCode, supplierConfigs.supplierCode),
+      )
+      .orderBy(asc(masterCatalog.internalSku)),
+    getLatestSkuLogisticsOverrides(),
+  ]);
 
   const grouped = new Map<string, CommandCenterSku>();
 
@@ -115,11 +140,17 @@ export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
       continue;
     }
 
+    const supplierName = formatSupplierName(row.supplierCode);
+    const committed = skuOverrides.get(`${row.internalSku}::${supplierName}`);
     const supplier: CommandCenterSupplier = {
-      supplierName: formatSupplierName(row.supplierCode),
+      supplierName,
+      supplierCode: row.supplierCode,
       fobPriceUsd: toNumber(row.fobPriceUsd),
-      freightPct: toRateDecimal(row.freightPct),
-      dutyPct: toRateDecimal(row.dutyPct),
+      freightPct:
+        committed?.freightPct ??
+        toRateDecimal(row.freightPct ?? row.freightFactorPct),
+      dutyPct:
+        committed?.dutyPct ?? toRateDecimal(row.dutyPct ?? row.importDutyPct),
     };
 
     const existing = grouped.get(row.internalSku);
@@ -131,6 +162,17 @@ export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
     grouped.set(row.internalSku, {
       internalSku: row.internalSku,
       productName: row.productName,
+      category: row.category,
+      targetCostUsd: toNumber(row.targetCostUsd),
+      retailPriceUsd: toNumber(row.retailPriceUsd),
+      targetMarginPct: toNumber(row.targetMarginPct),
+      minMarginPct: toNumber(row.minMarginPct),
+      primarySupplier: row.primarySupplier,
+      currentWarehouseStock: row.currentWarehouseStock ?? 0,
+      scarcityPremiumActive: Boolean(row.scarcityPremiumActive),
+      scarcityReviewDate: row.scarcityReviewDate
+        ? row.scarcityReviewDate.toISOString()
+        : null,
       suppliers: [supplier],
     });
   }

@@ -46,10 +46,12 @@ const MASTER_CATALOG_FIELDS = [
   "internalSku",
   "productName",
   "category",
-  "benchmarkCost",
-  "retailPrice",
+  "targetCostUsd",
+  "retailPriceUsd",
+  "targetMarginPct",
   "minMarginPct",
-  "currentStock",
+  "primarySupplier",
+  "currentWarehouseStock",
 ] as const;
 
 const MAPPING_FIELD_OPTIONS = [...MASTER_CATALOG_FIELDS, "ignore"] as const;

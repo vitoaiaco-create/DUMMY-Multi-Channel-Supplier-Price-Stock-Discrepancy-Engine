@@ -8,10 +8,12 @@ const MASTER_CATALOG_FIELDS = [
   "internalSku",
   "productName",
   "category",
-  "benchmarkCost",
-  "retailPrice",
+  "targetCostUsd",
+  "retailPriceUsd",
+  "targetMarginPct",
   "minMarginPct",
-  "currentStock",
+  "primarySupplier",
+  "currentWarehouseStock",
 ] as const;
 
 const columnMappingSchema = z.object({
@@ -70,7 +72,7 @@ export async function generateAiMapping(
       }),
       system: `You are an automotive/industrial spare parts data architect. I am providing you with the CSV headers and the first 3 rows of data from a supplier's price list. Map these columns to our internal database schema: ${MASTER_CATALOG_FIELDS.join(", ")}. If a column is irrelevant (e.g., 'Notes', 'Internal ID'), map it to 'ignore'.
 CRITICAL BUSINESS RULES: 
-1. Supplier stock/quantity columns (e.g., 'Qty_Available', 'Stock') MUST be mapped to 'ignore'. Do not map them to 'currentStock'. 'currentStock' is strictly for internal warehouse inventory.
+1. Supplier stock/quantity columns (e.g., 'Qty_Available', 'Stock') MUST be mapped to 'ignore'. Do not map them to 'currentWarehouseStock'. 'currentWarehouseStock' is strictly for internal warehouse inventory.
 2. Supplier lead times MUST be mapped to 'ignore'.`,
       prompt: [
         "Map every supplier CSV header to a masterCatalog field or ignore.",

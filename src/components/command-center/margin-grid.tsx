@@ -1,16 +1,19 @@
 "use client";
 
-import { ChevronDown, ChevronRight } from "lucide-react";
-import { useMemo, useState } from "react";
+import { ChevronDown, ChevronRight, CircleAlert, TriangleAlert } from "lucide-react";
+import { useState } from "react";
 
 import type { CommandCenterSku } from "@/app/actions/get-alerts";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
 import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import {
   Table,
   TableBody,
@@ -19,158 +22,138 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import {
+  calculateCurrentMarginPct,
+  calculateLiveRetailZmw,
+  formatFx,
+  formatMoney,
+  formatUsd,
+  formatZmw,
+  getFxPressure,
+  getMarginHealthStatus,
+  toDisplayCurrency,
+  toDisplayPct,
+  tlcToDisplayCurrency,
+  type CurrencyMode,
+  type LogisticsOverride,
+  type PricedSku,
+  type SupplierOffer,
+  type SupplierTlc,
+} from "@/lib/command-center-pricing";
 import { cn } from "@/lib/utils";
-
-type SupplierOffer = CommandCenterSku["suppliers"][number];
-type SkuGroup = CommandCenterSku;
-
-type LogisticsOverride = {
-  freightPct: number;
-  dutyPct: number;
-};
-
-type SupplierTlc = SupplierOffer & {
-  baseFobZmw: number;
-  freightZmw: number;
-  dutyZmw: number;
-  tlcZmw: number;
-  effectiveFreightPct: number;
-  effectiveDutyPct: number;
-  isOverridden: boolean;
-};
-
-type SkuTlcGroup = Omit<SkuGroup, "suppliers"> & {
-  suppliers: SupplierTlc[];
-  bestTlc: number;
-};
-
-function overrideKey(internalSku: string, supplierName: string) {
-  return `${internalSku}::${supplierName}`;
-}
-
-function ratesMatch(left: number, right: number) {
-  return Math.abs(left - right) < 1e-9;
-}
-
-function toDisplayPct(rate: number) {
-  return Number((rate * 100).toFixed(4));
-}
-
-function calculateTlc(
-  supplier: SupplierOffer,
-  currentFxRate: number,
-  override?: LogisticsOverride,
-): SupplierTlc {
-  const effectiveFreightPct = override?.freightPct ?? supplier.freightPct;
-  const effectiveDutyPct = override?.dutyPct ?? supplier.dutyPct;
-  const baseFobZmw = supplier.fobPriceUsd * currentFxRate;
-  const freightZmw = baseFobZmw * effectiveFreightPct;
-  const dutyZmw = baseFobZmw * effectiveDutyPct;
-  const tlcZmw =
-    supplier.fobPriceUsd *
-    currentFxRate *
-    (1 + effectiveFreightPct + effectiveDutyPct);
-
-  return {
-    ...supplier,
-    baseFobZmw,
-    freightZmw,
-    dutyZmw,
-    tlcZmw,
-    effectiveFreightPct,
-    effectiveDutyPct,
-    isOverridden: Boolean(override),
-  };
-}
-
-function formatUsd(value: number) {
-  return new Intl.NumberFormat("en-US", {
-    style: "currency",
-    currency: "USD",
-  }).format(value);
-}
-
-function formatZmw(value: number) {
-  return `ZMW ${value.toLocaleString("en-US", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
 
 function formatMarginPct(value: number) {
   return `${value.toFixed(1)}%`;
 }
 
+function isReviewRequired(reviewDate: string | null) {
+  if (!reviewDate) {
+    return false;
+  }
+  const parsed = new Date(reviewDate);
+  return Number.isFinite(parsed.getTime()) && parsed.getTime() < Date.now();
+}
+
 function MarginHealthBadge({
-  bestTlc,
-  retailPriceZmw,
+  currentMarginPct,
+  minMarginPct,
+  targetMarginPct,
 }: {
-  bestTlc: number;
-  retailPriceZmw?: number;
+  currentMarginPct: number | null;
+  minMarginPct: number;
+  targetMarginPct: number;
 }) {
-  if (retailPriceZmw == null || !Number.isFinite(retailPriceZmw)) {
-    return <Badge variant="secondary">No Baseline</Badge>;
+  const status = getMarginHealthStatus(
+    currentMarginPct,
+    minMarginPct,
+    targetMarginPct,
+  );
+
+  if (status === "none" || currentMarginPct == null) {
+    return <Badge variant="secondary">No Retail</Badge>;
   }
 
-  const marginPct = ((retailPriceZmw - bestTlc) / retailPriceZmw) * 100;
-
-  if (marginPct < 0) {
-    return <Badge variant="destructive">{formatMarginPct(marginPct)}</Badge>;
+  if (status === "red") {
+    return (
+      <Badge variant="destructive">{formatMarginPct(currentMarginPct)}</Badge>
+    );
   }
 
-  if (marginPct <= 15) {
+  if (status === "amber") {
     return (
       <Badge className="border-transparent bg-amber-500/15 text-amber-800 dark:text-amber-400">
-        {formatMarginPct(marginPct)}
+        {formatMarginPct(currentMarginPct)}
       </Badge>
     );
   }
 
   return (
     <Badge className="border-transparent bg-emerald-500/15 text-emerald-800 dark:text-emerald-400">
-      {formatMarginPct(marginPct)}
+      {formatMarginPct(currentMarginPct)}
     </Badge>
   );
 }
 
-export function MarginGrid({
-  baselinePrices,
+function BreakevenFxCell({
+  breakevenFx,
   currentFxRate,
-  data,
 }: {
-  baselinePrices: Record<string, number>;
+  breakevenFx: number | null;
   currentFxRate: number;
-  data: SkuGroup[];
+}) {
+  if (breakevenFx == null || !Number.isFinite(breakevenFx)) {
+    return <span className="text-muted-foreground">—</span>;
+  }
+
+  const pressure = getFxPressure(currentFxRate, breakevenFx);
+
+  return (
+    <div className="flex items-center gap-2 font-mono tabular-nums">
+      <span>{formatFx(breakevenFx)}</span>
+      {pressure === "amber" ? (
+        <TriangleAlert
+          aria-label="Current FX is within 1.00 ZMW of breakeven"
+          className="size-4 text-amber-600 dark:text-amber-400"
+        />
+      ) : null}
+      {pressure === "red" ? (
+        <CircleAlert
+          aria-label="Current FX exceeds breakeven"
+          className="size-4 text-destructive"
+        />
+      ) : null}
+    </div>
+  );
+}
+
+export function MarginGrid({
+  committingKey,
+  currencyMode,
+  currentFxRate,
+  onCommitOverride,
+  onLogisticsChange,
+  onToggleScarcity,
+  rows,
+  scarcityPendingSku,
+  stagedPriceUpdates,
+}: {
+  committingKey: string | null;
+  currencyMode: CurrencyMode;
+  currentFxRate: number;
+  onCommitOverride: (group: PricedSku, supplier: SupplierTlc) => void;
+  onLogisticsChange: (
+    internalSku: string,
+    supplier: SupplierOffer,
+    field: keyof LogisticsOverride,
+    nextDisplayPct: number,
+  ) => void;
+  onToggleScarcity: (sku: CommandCenterSku, isActive: boolean) => void;
+  rows: PricedSku[];
+  scarcityPendingSku: string | null;
+  stagedPriceUpdates: Record<string, number>;
 }) {
   const [expandedSkus, setExpandedSkus] = useState<Set<string>>(
     () => new Set(),
-  );
-  const [overrides, setOverrides] = useState<Record<string, LogisticsOverride>>(
-    {},
-  );
-
-  const rows = useMemo(
-    () =>
-      data.map((group) => {
-        const suppliers = group.suppliers.map((supplier) =>
-          calculateTlc(
-            supplier,
-            currentFxRate,
-            overrides[overrideKey(group.internalSku, supplier.supplierName)],
-          ),
-        );
-        const bestTlc =
-          suppliers.length === 0
-            ? Number.POSITIVE_INFINITY
-            : Math.min(...suppliers.map((supplier) => supplier.tlcZmw));
-
-        return {
-          ...group,
-          suppliers,
-          bestTlc,
-        };
-      }),
-    [currentFxRate, data, overrides],
   );
 
   function toggleSku(internalSku: string) {
@@ -185,40 +168,6 @@ export function MarginGrid({
     });
   }
 
-  function updateOverride(
-    internalSku: string,
-    supplier: SupplierOffer,
-    field: keyof LogisticsOverride,
-    nextDisplayPct: number,
-  ) {
-    const key = overrideKey(internalSku, supplier.supplierName);
-    const current = overrides[key];
-    const nextFreightPct =
-      field === "freightPct"
-        ? nextDisplayPct / 100
-        : (current?.freightPct ?? supplier.freightPct);
-    const nextDutyPct =
-      field === "dutyPct"
-        ? nextDisplayPct / 100
-        : (current?.dutyPct ?? supplier.dutyPct);
-
-    setOverrides((existing) => {
-      const next = { ...existing };
-      if (
-        ratesMatch(nextFreightPct, supplier.freightPct) &&
-        ratesMatch(nextDutyPct, supplier.dutyPct)
-      ) {
-        delete next[key];
-      } else {
-        next[key] = {
-          freightPct: nextFreightPct,
-          dutyPct: nextDutyPct,
-        };
-      }
-      return next;
-    });
-  }
-
   return (
     <Table>
       <TableHeader>
@@ -226,15 +175,34 @@ export function MarginGrid({
           <TableHead className="w-10" />
           <TableHead>Internal SKU</TableHead>
           <TableHead>Product Name</TableHead>
+          <TableHead>Category</TableHead>
+          <TableHead className="text-right">
+            Target Cost ({currencyMode})
+          </TableHead>
+          <TableHead className="text-right">
+            Retail Price ({currencyMode})
+          </TableHead>
+          <TableHead className="text-right">Target Margin %</TableHead>
+          <TableHead className="text-right">Min Margin %</TableHead>
+          <TableHead>Primary Supplier</TableHead>
+          <TableHead className="text-right">Current Warehouse Stock</TableHead>
+          <TableHead className="text-right">
+            Live Retail ({currencyMode})
+          </TableHead>
+          <TableHead className="text-right">
+            Best TLC ({currencyMode})
+          </TableHead>
           <TableHead>Suppliers Available</TableHead>
           <TableHead>Margin Health</TableHead>
+          <TableHead>Breakeven FX</TableHead>
+          <TableHead>Market Scarcity</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.length === 0 ? (
           <TableRow>
             <TableCell
-              colSpan={5}
+              colSpan={16}
               className="py-10 text-center text-muted-foreground"
             >
               No active supplier pricing found.
@@ -247,11 +215,17 @@ export function MarginGrid({
             return (
               <SkuExpandableRows
                 key={group.internalSku}
-                baselineRetailPrice={baselinePrices[group.internalSku]}
+                committingKey={committingKey}
+                currencyMode={currencyMode}
+                currentFxRate={currentFxRate}
                 group={group}
                 isExpanded={isExpanded}
-                onLogisticsChange={updateOverride}
+                scarcityPending={scarcityPendingSku === group.internalSku}
+                stagedRetailUsd={stagedPriceUpdates[group.internalSku]}
+                onCommitOverride={onCommitOverride}
+                onLogisticsChange={onLogisticsChange}
                 onToggle={() => toggleSku(group.internalSku)}
+                onToggleScarcity={onToggleScarcity}
               />
             );
           })
@@ -262,15 +236,24 @@ export function MarginGrid({
 }
 
 function SkuExpandableRows({
-  baselineRetailPrice,
+  committingKey,
+  currencyMode,
+  currentFxRate,
   group,
   isExpanded,
+  onCommitOverride,
   onLogisticsChange,
   onToggle,
+  onToggleScarcity,
+  scarcityPending,
+  stagedRetailUsd,
 }: {
-  baselineRetailPrice?: number;
-  group: SkuTlcGroup;
+  committingKey: string | null;
+  currencyMode: CurrencyMode;
+  currentFxRate: number;
+  group: PricedSku;
   isExpanded: boolean;
+  onCommitOverride: (group: PricedSku, supplier: SupplierTlc) => void;
   onLogisticsChange: (
     internalSku: string,
     supplier: SupplierOffer,
@@ -278,11 +261,46 @@ function SkuExpandableRows({
     nextDisplayPct: number,
   ) => void;
   onToggle: () => void;
+  onToggleScarcity: (sku: CommandCenterSku, isActive: boolean) => void;
+  scarcityPending: boolean;
+  stagedRetailUsd?: number;
 }) {
+  const reviewRequired = isReviewRequired(group.scarcityReviewDate);
+  const scarcitySwitchId = `scarcity-${group.internalSku}`;
+  const isStaged = stagedRetailUsd != null;
+  const displayRetailUsd = isStaged ? stagedRetailUsd : group.retailPriceUsd;
+  const displayLiveRetailZmw = calculateLiveRetailZmw(
+    displayRetailUsd,
+    currentFxRate,
+  );
+  const displayLiveRetail =
+    currencyMode === "ZMW" ? displayLiveRetailZmw : displayRetailUsd;
+  const displayMarginPct = isStaged
+    ? calculateCurrentMarginPct(displayLiveRetailZmw, group.bestTlc)
+    : group.currentMarginPct;
+  const displayTargetCost = toDisplayCurrency(
+    group.targetCostUsd,
+    currencyMode,
+    currentFxRate,
+  );
+  const displayRetailPrice = toDisplayCurrency(
+    displayRetailUsd,
+    currencyMode,
+    currentFxRate,
+  );
+  const displayBestTlc = tlcToDisplayCurrency(
+    group.bestTlc,
+    currencyMode,
+    currentFxRate,
+  );
+
   return (
     <>
       <TableRow
-        className="cursor-pointer"
+        className={cn(
+          "cursor-pointer",
+          isStaged && "bg-blue-500/10 hover:bg-blue-500/15",
+        )}
         aria-expanded={isExpanded}
         onClick={onToggle}
         onKeyDown={(event) => {
@@ -304,6 +322,31 @@ function SkuExpandableRows({
           {group.internalSku}
         </TableCell>
         <TableCell>{group.productName}</TableCell>
+        <TableCell>{group.category ?? "—"}</TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {formatMoney(displayTargetCost, currencyMode)}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {formatMoney(displayRetailPrice, currencyMode)}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {formatMarginPct(group.targetMarginPct)}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {formatMarginPct(group.minMarginPct)}
+        </TableCell>
+        <TableCell className="font-mono">
+          {group.primarySupplier ?? "—"}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {group.currentWarehouseStock}
+        </TableCell>
+        <TableCell className="text-right font-mono tabular-nums">
+          {formatMoney(displayLiveRetail, currencyMode)}
+        </TableCell>
+        <TableCell className="text-right font-mono font-semibold tabular-nums">
+          {formatMoney(displayBestTlc, currencyMode)}
+        </TableCell>
         <TableCell>
           <Badge variant="secondary">
             {group.suppliers.length}{" "}
@@ -312,14 +355,46 @@ function SkuExpandableRows({
         </TableCell>
         <TableCell>
           <MarginHealthBadge
-            bestTlc={group.bestTlc}
-            retailPriceZmw={baselineRetailPrice}
+            currentMarginPct={displayMarginPct}
+            minMarginPct={group.minMarginPct}
+            targetMarginPct={group.targetMarginPct}
           />
+        </TableCell>
+        <TableCell>
+          <BreakevenFxCell
+            breakevenFx={group.breakevenFx}
+            currentFxRate={currentFxRate}
+          />
+        </TableCell>
+        <TableCell>
+          <div
+            className="flex flex-col items-start gap-2"
+            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center gap-2">
+              <Switch
+                id={scarcitySwitchId}
+                checked={group.scarcityPremiumActive}
+                disabled={scarcityPending}
+                onCheckedChange={(checked) =>
+                  onToggleScarcity(group, Boolean(checked))
+                }
+                aria-label={`Market Scarcity (+10%) for ${group.internalSku}`}
+              />
+              <Label htmlFor={scarcitySwitchId} className="text-xs font-normal">
+                Market Scarcity (+10%)
+              </Label>
+            </div>
+            {reviewRequired ? (
+              <Badge variant="destructive">Review Required</Badge>
+            ) : null}
+          </div>
         </TableCell>
       </TableRow>
       {isExpanded ? (
         <TableRow className="hover:bg-transparent">
-          <TableCell colSpan={5} className="bg-muted/30 p-0 whitespace-normal">
+          <TableCell colSpan={16} className="bg-muted/30 p-0 whitespace-normal">
             <div className="px-4 py-3">
               <p className="mb-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
                 SKU cross-analysis · {group.internalSku}
@@ -331,6 +406,7 @@ function SkuExpandableRows({
                     <TableHead className="text-right">FOB (USD)</TableHead>
                     <TableHead className="text-right">Freight</TableHead>
                     <TableHead className="text-right">Duty</TableHead>
+                    <TableHead />
                     <TableHead className="text-right">TLC (ZMW)</TableHead>
                     <TableHead />
                   </TableRow>
@@ -338,6 +414,7 @@ function SkuExpandableRows({
                 <TableBody>
                   {group.suppliers.map((supplier) => {
                     const isBest = supplier.tlcZmw === group.bestTlc;
+                    const commitKey = `${group.internalSku}::${supplier.supplierName}`;
 
                     return (
                       <TableRow
@@ -383,6 +460,22 @@ function SkuExpandableRows({
                               )
                             }
                           />
+                        </TableCell>
+                        <TableCell>
+                          {supplier.isOverridden ? (
+                            <Button
+                              size="sm"
+                              disabled={committingKey === commitKey}
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                onCommitOverride(group, supplier);
+                              }}
+                            >
+                              {committingKey === commitKey
+                                ? "Saving..."
+                                : "Commit"}
+                            </Button>
+                          ) : null}
                         </TableCell>
                         <TableCell className="text-right">
                           <HoverCard>

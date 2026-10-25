@@ -2,6 +2,7 @@ import { createReadStream } from "node:fs";
 import { resolve } from "node:path";
 import { config } from "dotenv";
 import csv from "csv-parser";
+import { sql } from "drizzle-orm";
 
 config({ path: ".env" });
 
@@ -11,7 +12,9 @@ type CatalogCsvRow = {
   category: string;
   target_cost_usd: string;
   retail_price_usd: string;
+  target_margin_pct: string;
   min_margin_pct: string;
+  primary_supplier: string;
   current_warehouse_stock: string;
 };
 
@@ -42,17 +45,34 @@ async function seed() {
     internalSku: row.internal_sku,
     productName: row.product_name,
     category: row.category,
-    benchmarkCost: String(row.target_cost_usd),
-    retailPrice: String(row.retail_price_usd),
+    targetCostUsd: String(row.target_cost_usd),
+    retailPriceUsd: String(row.retail_price_usd),
+    targetMarginPct: String(row.target_margin_pct),
     minMarginPct: String(row.min_margin_pct),
-    currentStock: parseInt(row.current_warehouse_stock, 10),
+    primarySupplier: row.primary_supplier,
+    currentWarehouseStock: parseInt(row.current_warehouse_stock, 10),
   }));
 
   for (let i = 0; i < records.length; i += BATCH_SIZE) {
     const batch = records.slice(i, i + BATCH_SIZE);
     const batchNumber = Math.floor(i / BATCH_SIZE) + 1;
-    await db.insert(masterCatalog).values(batch);
-    console.log(`Batch ${batchNumber} inserted...`);
+    await db
+      .insert(masterCatalog)
+      .values(batch)
+      .onConflictDoUpdate({
+        target: masterCatalog.internalSku,
+        set: {
+          productName: sql`excluded."productName"`,
+          category: sql`excluded.category`,
+          targetCostUsd: sql`excluded."targetCostUsd"`,
+          retailPriceUsd: sql`excluded."retailPriceUsd"`,
+          targetMarginPct: sql`excluded."targetMarginPct"`,
+          minMarginPct: sql`excluded."minMarginPct"`,
+          primarySupplier: sql`excluded."primarySupplier"`,
+          currentWarehouseStock: sql`excluded."currentWarehouseStock"`,
+        },
+      });
+    console.log(`Batch ${batchNumber} upserted...`);
   }
 
   console.log("Seeding complete");

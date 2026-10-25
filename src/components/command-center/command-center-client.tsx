@@ -1,13 +1,17 @@
 "use client";
 
-import { FileSpreadsheet, UploadCloud } from "lucide-react";
+import { CircleDollarSign, FileDown } from "lucide-react";
+import { useRouter } from "next/navigation";
 import Papa from "papaparse";
-import { useCallback, useMemo, useState } from "react";
-import { useDropzone } from "react-dropzone";
+import { useEffect, useMemo, useState } from "react";
 
 import type { CommandCenterSku } from "@/app/actions/get-alerts";
+import {
+  commitLogisticsOverride,
+  toggleScarcityPremium,
+} from "@/app/actions/overrides";
+import { commitBulkReprice } from "@/app/actions/reprice";
 import { MarginGrid } from "@/components/command-center/margin-grid";
-import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -16,14 +20,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import {
   Select,
@@ -33,25 +29,48 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
-import { cn } from "@/lib/utils";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  formatFx,
+  getMarginHealthStatus,
+  isBelowMinMargin,
+  overrideKey,
+  priceCommandCenterSku,
+  ratesMatch,
+  requiredRetailUsdForMinMargin,
+  type CurrencyMode,
+  type LogisticsOverride,
+  type MarginHealthStatus,
+  type PricedSku,
+  type SupplierOffer,
+  type SupplierTlc,
+} from "@/lib/command-center-pricing";
 
 const DEFAULT_FX = 27.5;
 const MIN_FX = 20;
 const MAX_FX = 35;
 const FX_STEP = 0.1;
 
+const MASTER_EXPORT_HEADERS = [
+  "internal_sku",
+  "product_name",
+  "category",
+  "target_cost_usd",
+  "retail_price_usd",
+  "target_margin_pct",
+  "min_margin_pct",
+  "primary_supplier",
+  "current_warehouse_stock",
+] as const;
+
 const MARGIN_HEALTH_ITEMS = [
   { label: "All", value: "all" },
-  { label: "Negative (< 0%)", value: "negative" },
-  { label: "At Risk (0 - 15%)", value: "at-risk" },
-  { label: "Healthy (> 15%)", value: "healthy" },
+  { label: "Below Min", value: "red" },
+  { label: "Below Target", value: "amber" },
+  { label: "On Target", value: "green" },
 ] as const;
 
 type MarginHealthFilter = (typeof MARGIN_HEALTH_ITEMS)[number]["value"];
-
-function formatFx(value: number) {
-  return value.toFixed(2);
-}
 
 function isMarginHealthFilter(value: unknown): value is MarginHealthFilter {
   return (
@@ -60,46 +79,118 @@ function isMarginHealthFilter(value: unknown): value is MarginHealthFilter {
   );
 }
 
-function calculateBestTlc(sku: CommandCenterSku, currentFxRate: number) {
-  if (sku.suppliers.length === 0) {
-    return Number.POSITIVE_INFINITY;
-  }
-
-  return Math.min(
-    ...sku.suppliers.map(
-      (supplier) =>
-        supplier.fobPriceUsd *
-        currentFxRate *
-        (1 + supplier.freightPct + supplier.dutyPct),
-    ),
-  );
+function isCurrencyMode(value: unknown): value is CurrencyMode {
+  return value === "USD" || value === "ZMW";
 }
 
-function calculateMarginPct(retailPriceZmw: number, bestTlc: number) {
-  if (!Number.isFinite(retailPriceZmw) || retailPriceZmw <= 0) {
-    return null;
-  }
-
-  return ((retailPriceZmw - bestTlc) / retailPriceZmw) * 100;
-}
-
-function matchesMarginHealth(
-  marginPct: number | null,
-  filter: MarginHealthFilter,
-) {
+function matchesMarginHealth(row: PricedSku, filter: MarginHealthFilter) {
   if (filter === "all") {
     return true;
   }
-  if (marginPct == null || !Number.isFinite(marginPct)) {
-    return false;
+
+  return (
+    getMarginHealthStatus(
+      row.currentMarginPct,
+      row.minMarginPct,
+      row.targetMarginPct,
+    ) === (filter as MarginHealthStatus)
+  );
+}
+
+function toExportNumber(value: number, digits = 2) {
+  if (!Number.isFinite(value)) {
+    return "";
   }
-  if (filter === "negative") {
-    return marginPct < 0;
-  }
-  if (filter === "at-risk") {
-    return marginPct >= 0 && marginPct <= 15;
-  }
-  return marginPct > 15;
+  return Number(value.toFixed(digits));
+}
+
+function toMasterExportRow(row: PricedSku) {
+  return {
+    internal_sku: row.internalSku,
+    product_name: row.productName,
+    category: row.category ?? "",
+    target_cost_usd: toExportNumber(row.bestTlcUsd),
+    retail_price_usd: toExportNumber(row.retailPriceUsd),
+    target_margin_pct: toExportNumber(row.targetMarginPct, 1),
+    min_margin_pct: toExportNumber(row.minMarginPct, 1),
+    primary_supplier: row.primarySupplier ?? "",
+    current_warehouse_stock: row.currentWarehouseStock,
+  };
+}
+
+function downloadCsv(filename: string, csv: string) {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function exportMasterPriceList(rows: PricedSku[], currentFxRate: number) {
+  const exportRows = rows.map(toMasterExportRow);
+  const stamp = formatFx(currentFxRate);
+  const csv = Papa.unparse(exportRows, {
+    columns: [...MASTER_EXPORT_HEADERS],
+  });
+  downloadCsv(`lua-lua-master-price-list-${stamp}.csv`, csv);
+
+  const [{ default: jsPDF }, { default: autoTable }] = await Promise.all([
+    import("jspdf"),
+    import("jspdf-autotable"),
+  ]);
+
+  const doc = new jsPDF({
+    orientation: "landscape",
+    unit: "mm",
+    format: "a4",
+  });
+  const generatedAt = new Date().toLocaleString("en-ZM");
+
+  doc.setFontSize(16);
+  doc.text("Lua Lua Master Price List", 14, 18);
+  doc.setFontSize(10);
+  doc.setTextColor(90);
+  doc.text(`Live FX ${formatFx(currentFxRate)} USD/ZMW · ${generatedAt}`, 14, 25);
+  doc.text(
+    "target_cost_usd is the live Best TLC (USD) for ERP benchmark updates.",
+    14,
+    31,
+  );
+  doc.setTextColor(0);
+
+  autoTable(doc, {
+    startY: 36,
+    head: [[...MASTER_EXPORT_HEADERS]],
+    body: exportRows.map((row) =>
+      MASTER_EXPORT_HEADERS.map((header) => String(row[header])),
+    ),
+    styles: {
+      fontSize: 7,
+      cellPadding: 1.5,
+    },
+    headStyles: {
+      fillColor: [24, 24, 27],
+      textColor: 255,
+      fontStyle: "bold",
+    },
+    columnStyles: {
+      0: { cellWidth: 28, font: "courier" },
+      1: { cellWidth: 52 },
+      2: { cellWidth: 24 },
+      3: { cellWidth: 24, halign: "right", font: "courier" },
+      4: { cellWidth: 24, halign: "right", font: "courier" },
+      5: { cellWidth: 24, halign: "right", font: "courier" },
+      6: { cellWidth: 22, halign: "right", font: "courier" },
+      7: { cellWidth: 32, font: "courier" },
+      8: { cellWidth: 28, halign: "right", font: "courier" },
+    },
+  });
+
+  doc.save(`lua-lua-master-price-list-${stamp}.pdf`);
 }
 
 export function CommandCenterClient({
@@ -107,28 +198,239 @@ export function CommandCenterClient({
 }: {
   initialData: CommandCenterSku[];
 }) {
+  const router = useRouter();
   const [fxRate, setFxRate] = useState(DEFAULT_FX);
-  const [baselinePrices, setBaselinePrices] = useState<Record<string, number>>(
+  const [currencyMode, setCurrencyMode] = useState<CurrencyMode>("ZMW");
+  const [marginHealth, setMarginHealth] = useState<MarginHealthFilter>("all");
+  const [skuData, setSkuData] = useState(initialData);
+  const [overrides, setOverrides] = useState<Record<string, LogisticsOverride>>(
     {},
   );
-  const [marginHealth, setMarginHealth] = useState<MarginHealthFilter>("all");
+  const [stagedPriceUpdates, setStagedPriceUpdates] = useState<
+    Record<string, number>
+  >({});
+  const [committingKey, setCommittingKey] = useState<string | null>(null);
+  const [scarcityPendingSku, setScarcityPendingSku] = useState<string | null>(
+    null,
+  );
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isCommittingReprice, setIsCommittingReprice] = useState(false);
+
+  useEffect(() => {
+    setSkuData(initialData);
+  }, [initialData]);
+
+  const pricedRows = useMemo(
+    () => skuData.map((sku) => priceCommandCenterSku(sku, fxRate, overrides)),
+    [fxRate, overrides, skuData],
+  );
 
   const filteredData = useMemo(() => {
     if (marginHealth === "all") {
-      return initialData;
+      return pricedRows;
     }
 
-    return initialData.filter((sku) => {
-      const retailPriceZmw = baselinePrices[sku.internalSku];
-      const marginPct = calculateMarginPct(
-        retailPriceZmw,
-        calculateBestTlc(sku, fxRate),
-      );
-      return matchesMarginHealth(marginPct, marginHealth);
-    });
-  }, [baselinePrices, fxRate, initialData, marginHealth]);
+    return pricedRows.filter((sku) => matchesMarginHealth(sku, marginHealth));
+  }, [marginHealth, pricedRows]);
 
-  const baselineCount = Object.keys(baselinePrices).length;
+  const underperformingInView = useMemo(
+    () => filteredData.filter(isBelowMinMargin),
+    [filteredData],
+  );
+
+  const stagedCount = Object.keys(stagedPriceUpdates).length;
+
+  function updateOverride(
+    internalSku: string,
+    supplier: SupplierOffer,
+    field: keyof LogisticsOverride,
+    nextDisplayPct: number,
+  ) {
+    const key = overrideKey(internalSku, supplier.supplierName);
+    const current = overrides[key];
+    const nextFreightPct =
+      field === "freightPct"
+        ? nextDisplayPct / 100
+        : (current?.freightPct ?? supplier.freightPct);
+    const nextDutyPct =
+      field === "dutyPct"
+        ? nextDisplayPct / 100
+        : (current?.dutyPct ?? supplier.dutyPct);
+
+    setOverrides((existing) => {
+      const next = { ...existing };
+      if (
+        ratesMatch(nextFreightPct, supplier.freightPct) &&
+        ratesMatch(nextDutyPct, supplier.dutyPct)
+      ) {
+        delete next[key];
+      } else {
+        next[key] = {
+          freightPct: nextFreightPct,
+          dutyPct: nextDutyPct,
+        };
+      }
+      return next;
+    });
+  }
+
+  async function handleCommitOverride(group: PricedSku, supplier: SupplierTlc) {
+    const key = overrideKey(group.internalSku, supplier.supplierName);
+    setActionError(null);
+    setCommittingKey(key);
+
+    const result = await commitLogisticsOverride(
+      supplier.supplierName,
+      group.internalSku,
+      supplier.effectiveFreightPct,
+      supplier.effectiveDutyPct,
+    );
+
+    if (!result.success) {
+      setActionError(result.error);
+      setCommittingKey(null);
+      return;
+    }
+
+    setSkuData((current) =>
+      current.map((sku) =>
+        sku.internalSku === group.internalSku
+          ? {
+              ...sku,
+              suppliers: sku.suppliers.map((offer) =>
+                offer.supplierName === supplier.supplierName
+                  ? {
+                      ...offer,
+                      freightPct: supplier.effectiveFreightPct,
+                      dutyPct: supplier.effectiveDutyPct,
+                    }
+                  : offer,
+              ),
+            }
+          : sku,
+      ),
+    );
+    setOverrides((existing) => {
+      const next = { ...existing };
+      delete next[key];
+      return next;
+    });
+    setCommittingKey(null);
+  }
+
+  async function handleToggleScarcity(sku: CommandCenterSku, isActive: boolean) {
+    const previous = sku.scarcityPremiumActive;
+    const previousReviewDate = sku.scarcityReviewDate;
+    setActionError(null);
+    setScarcityPendingSku(sku.internalSku);
+    setSkuData((current) =>
+      current.map((row) =>
+        row.internalSku === sku.internalSku
+          ? {
+              ...row,
+              scarcityPremiumActive: isActive,
+              scarcityReviewDate: isActive
+                ? new Date(Date.now() + 14 * 24 * 60 * 60 * 1000).toISOString()
+                : null,
+            }
+          : row,
+      ),
+    );
+
+    const result = await toggleScarcityPremium(sku.internalSku, isActive);
+    if (!result.success) {
+      setActionError(result.error);
+      setSkuData((current) =>
+        current.map((row) =>
+          row.internalSku === sku.internalSku
+            ? {
+                ...row,
+                scarcityPremiumActive: previous,
+                scarcityReviewDate: previousReviewDate,
+              }
+            : row,
+        ),
+      );
+    }
+    setScarcityPendingSku(null);
+  }
+
+  async function handleExport() {
+    setActionError(null);
+    setIsExporting(true);
+    try {
+      await exportMasterPriceList(filteredData, fxRate);
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Failed to export the master price list.",
+      );
+    } finally {
+      setIsExporting(false);
+    }
+  }
+
+  function handleRepriceToMinimum() {
+    const next: Record<string, number> = {};
+
+    for (const row of underperformingInView) {
+      const requiredUsd = requiredRetailUsdForMinMargin(
+        row.bestTlc,
+        row.minMarginPct,
+        fxRate,
+      );
+      if (requiredUsd == null) {
+        continue;
+      }
+      next[row.internalSku] = requiredUsd;
+    }
+
+    setStagedPriceUpdates(next);
+  }
+
+  async function handleCommitPriceHikes() {
+    const updates = Object.entries(stagedPriceUpdates).map(
+      ([internalSku, newRetailPriceUsd]) => ({
+        internalSku,
+        newRetailPriceUsd,
+      }),
+    );
+    if (updates.length === 0) {
+      return;
+    }
+
+    setActionError(null);
+    setIsCommittingReprice(true);
+
+    try {
+      const result = await commitBulkReprice(updates);
+      if (!result.success) {
+        setActionError(result.error);
+        return;
+      }
+
+      setSkuData((current) =>
+        current.map((sku) => {
+          const nextPrice = stagedPriceUpdates[sku.internalSku];
+          return nextPrice == null
+            ? sku
+            : { ...sku, retailPriceUsd: nextPrice };
+        }),
+      );
+      setStagedPriceUpdates({});
+      router.refresh();
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Failed to commit price hikes. Please try again.",
+      );
+    } finally {
+      setIsCommittingReprice(false);
+    }
+  }
 
   return (
     <section className="w-full space-y-8">
@@ -184,6 +486,22 @@ export function CommandCenterClient({
                 </p>
               </div>
               <div className="space-y-2">
+                <Label htmlFor="currency-view">Currency View</Label>
+                <Tabs
+                  value={currencyMode}
+                  onValueChange={(value) => {
+                    if (isCurrencyMode(value)) {
+                      setCurrencyMode(value);
+                    }
+                  }}
+                >
+                  <TabsList id="currency-view" aria-label="Currency view">
+                    <TabsTrigger value="ZMW">ZMW</TabsTrigger>
+                    <TabsTrigger value="USD">USD</TabsTrigger>
+                  </TabsList>
+                </Tabs>
+              </div>
+              <div className="space-y-2">
                 <Label htmlFor="margin-health-filter">Margin Health</Label>
                 <Select
                   items={[...MARGIN_HEALTH_ITEMS]}
@@ -210,12 +528,47 @@ export function CommandCenterClient({
                   </SelectContent>
                 </Select>
               </div>
-              <BaselinePriceDialog
-                baselineCount={baselineCount}
-                onBaselinesParsed={setBaselinePrices}
-              />
+              <Button
+                variant="outline"
+                disabled={
+                  isExporting ||
+                  isCommittingReprice ||
+                  underperformingInView.length === 0
+                }
+                onClick={handleRepriceToMinimum}
+              >
+                Reprice to Minimum
+              </Button>
+              {stagedCount > 0 ? (
+                <Button
+                  disabled={isCommittingReprice}
+                  onClick={() => {
+                    void handleCommitPriceHikes();
+                  }}
+                >
+                  <CircleDollarSign data-icon="inline-start" />
+                  {isCommittingReprice
+                    ? "Committing..."
+                    : `Commit Price Hikes (${stagedCount})`}
+                </Button>
+              ) : null}
+              <Button
+                variant="outline"
+                disabled={isExporting || filteredData.length === 0}
+                onClick={() => {
+                  void handleExport();
+                }}
+              >
+                <FileDown data-icon="inline-start" />
+                {isExporting ? "Exporting..." : "Export Master Price List"}
+              </Button>
             </div>
           </div>
+          {actionError ? (
+            <p className="mt-4 text-sm text-destructive" role="alert">
+              {actionError}
+            </p>
+          ) : null}
         </CardContent>
       </Card>
 
@@ -227,163 +580,20 @@ export function CommandCenterClient({
             rate. Hover a TLC value for the freight and duty breakdown.
           </CardDescription>
         </CardHeader>
-        <CardContent className="p-0">
+        <CardContent className="overflow-x-auto p-0">
           <MarginGrid
-            baselinePrices={baselinePrices}
+            committingKey={committingKey}
+            currencyMode={currencyMode}
             currentFxRate={fxRate}
-            data={filteredData}
+            rows={filteredData}
+            scarcityPendingSku={scarcityPendingSku}
+            stagedPriceUpdates={stagedPriceUpdates}
+            onCommitOverride={handleCommitOverride}
+            onLogisticsChange={updateOverride}
+            onToggleScarcity={handleToggleScarcity}
           />
         </CardContent>
       </Card>
     </section>
-  );
-}
-
-function BaselinePriceDialog({
-  baselineCount,
-  onBaselinesParsed,
-}: {
-  baselineCount: number;
-  onBaselinesParsed: (prices: Record<string, number>) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const [parseError, setParseError] = useState<string | null>(null);
-  const [fileName, setFileName] = useState<string | null>(null);
-
-  const parseCsv = useCallback(
-    (file: File) => {
-      setParseError(null);
-      setFileName(file.name);
-
-      Papa.parse<Record<string, string>>(file, {
-        header: true,
-        skipEmptyLines: true,
-        transformHeader(header) {
-          return header.replace(/^\uFEFF/, "").trim();
-        },
-        complete(results) {
-          const rows = results.data;
-          const headerKeys = results.meta.fields ?? Object.keys(rows[0] ?? {});
-          const skuKey = headerKeys.find(
-            (key) => key.toLowerCase() === "internalsku",
-          );
-          const priceKey = headerKeys.find(
-            (key) => key.toLowerCase() === "retailpricezmw",
-          );
-
-          if (!skuKey || !priceKey) {
-            setParseError(
-              "CSV must include internalSku and retailPriceZmw columns.",
-            );
-            return;
-          }
-
-          const next: Record<string, number> = {};
-          for (const row of rows) {
-            const sku = String(row[skuKey] ?? "").trim();
-            const price = Number(String(row[priceKey] ?? "").replace(/,/g, ""));
-            if (!sku || !Number.isFinite(price) || price <= 0) {
-              continue;
-            }
-            next[sku] = price;
-          }
-
-          const count = Object.keys(next).length;
-          if (count === 0) {
-            setParseError("No valid internalSku / retailPriceZmw rows found.");
-            return;
-          }
-
-          onBaselinesParsed(next);
-          setOpen(false);
-        },
-        error(error) {
-          setParseError(error.message);
-        },
-      });
-    },
-    [onBaselinesParsed],
-  );
-
-  const onDrop = useCallback(
-    (acceptedFiles: File[]) => {
-      const file = acceptedFiles[0];
-      if (file) parseCsv(file);
-    },
-    [parseCsv],
-  );
-
-  const { getRootProps, getInputProps, isDragActive, isDragReject } =
-    useDropzone({
-      onDrop,
-      accept: { "text/csv": [".csv"] },
-      multiple: false,
-      maxFiles: 1,
-      onDropRejected() {
-        setFileName(null);
-        setParseError("Only .csv files are accepted.");
-      },
-    });
-
-  return (
-    <Dialog
-      open={open}
-      onOpenChange={(nextOpen) => {
-        setOpen(nextOpen);
-        if (!nextOpen) {
-          setParseError(null);
-          setFileName(null);
-        }
-      }}
-    >
-      <DialogTrigger render={<Button variant="outline" />}>
-        Set Baseline Prices
-        {baselineCount > 0 ? (
-          <Badge variant="secondary">{baselineCount}</Badge>
-        ) : null}
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Set baseline retail prices</DialogTitle>
-          <DialogDescription>
-            Upload a CSV with <code>internalSku</code> and{" "}
-            <code>retailPriceZmw</code> to score live margin health.
-          </DialogDescription>
-        </DialogHeader>
-        <div
-          {...getRootProps()}
-          className={cn(
-            "flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 py-10 text-center transition-colors",
-            isDragActive && !isDragReject && "border-primary bg-primary/5",
-            isDragReject && "border-destructive bg-destructive/5",
-            !isDragActive && "border-border hover:border-primary/50",
-          )}
-        >
-          <input {...getInputProps()} />
-          <UploadCloud className="mb-3 size-8 text-muted-foreground" />
-          <p className="font-medium">
-            {isDragActive
-              ? "Drop the CSV file here"
-              : "Drag and drop a CSV file, or click to browse"}
-          </p>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Required columns: internalSku, retailPriceZmw
-          </p>
-        </div>
-        {fileName ? (
-          <div className="flex items-center gap-2">
-            <Badge variant="secondary">
-              <FileSpreadsheet data-icon="inline-start" />
-              {fileName}
-            </Badge>
-          </div>
-        ) : null}
-        {parseError ? (
-          <p className="text-sm text-destructive" role="alert">
-            {parseError}
-          </p>
-        ) : null}
-      </DialogContent>
-    </Dialog>
   );
 }
