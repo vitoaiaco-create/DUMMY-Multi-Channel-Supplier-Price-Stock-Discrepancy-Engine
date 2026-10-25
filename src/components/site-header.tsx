@@ -1,8 +1,27 @@
+"use client";
+
 import { SignInButton, SignUpButton, Show, UserButton } from "@clerk/nextjs";
+import { usePathname } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
 
+const DASHBOARD_ROUTES = [
+  "/ingestion",
+  "/command-center",
+  "/price-lists",
+  "/analytics",
+];
+
 export function SiteHeader() {
+  const pathname = usePathname();
+  const isDashboard = DASHBOARD_ROUTES.some(
+    (route) => pathname === route || pathname.startsWith(`${route}/`),
+  );
+
+  if (isDashboard) {
+    return null;
+  }
+
   return (
     <header className="flex h-16 w-full items-center border-b border-border">
       <div className="mx-auto flex w-full max-w-7xl items-center justify-between px-6 sm:px-10 lg:px-16">
