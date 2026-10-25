@@ -1,9 +1,9 @@
 "use server";
 
-import { eq } from "drizzle-orm";
+import { asc, eq } from "drizzle-orm";
 
 import { db } from "@/db";
-import { marginAlerts, masterCatalog } from "@/db/schema";
+import { marginAlerts, masterCatalog, supplierConfigs } from "@/db/schema";
 
 export type MarginAlert = {
   id: string;
@@ -15,6 +15,19 @@ export type MarginAlert = {
   retailPriceZmw: number;
   newMarginPct: number;
   fxRateUsed: number;
+};
+
+export type CommandCenterSupplier = {
+  supplierName: string;
+  fobPriceUsd: number;
+  freightPct: number;
+  dutyPct: number;
+};
+
+export type CommandCenterSku = {
+  internalSku: string;
+  productName: string;
+  suppliers: CommandCenterSupplier[];
 };
 
 function toNumber(value: string | number | null | undefined): number {
@@ -59,4 +72,68 @@ export async function getAlerts(): Promise<MarginAlert[]> {
     newMarginPct: toNumber(row.newMarginPct),
     fxRateUsed: toNumber(row.fxRateUsed),
   }));
+}
+
+function formatSupplierName(supplierCode: string) {
+  return supplierCode
+    .replace(/^SUP_/, "")
+    .split(/[_-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1).toLowerCase())
+    .join(" ");
+}
+
+function toRateDecimal(value: string | number | null | undefined): number {
+  return toNumber(value) / 100;
+}
+
+export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
+  const rows = await db
+    .select({
+      internalSku: masterCatalog.internalSku,
+      productName: masterCatalog.productName,
+      supplierCode: marginAlerts.supplierCode,
+      fobPriceUsd: marginAlerts.supplierFobCostUsd,
+      freightPct: supplierConfigs.freightFactorPct,
+      dutyPct: supplierConfigs.importDutyPct,
+    })
+    .from(masterCatalog)
+    .innerJoin(
+      marginAlerts,
+      eq(masterCatalog.internalSku, marginAlerts.internalSku),
+    )
+    .leftJoin(
+      supplierConfigs,
+      eq(marginAlerts.supplierCode, supplierConfigs.supplierCode),
+    )
+    .orderBy(asc(masterCatalog.internalSku));
+
+  const grouped = new Map<string, CommandCenterSku>();
+
+  for (const row of rows) {
+    if (row.fobPriceUsd == null) {
+      continue;
+    }
+
+    const supplier: CommandCenterSupplier = {
+      supplierName: formatSupplierName(row.supplierCode),
+      fobPriceUsd: toNumber(row.fobPriceUsd),
+      freightPct: toRateDecimal(row.freightPct),
+      dutyPct: toRateDecimal(row.dutyPct),
+    };
+
+    const existing = grouped.get(row.internalSku);
+    if (existing) {
+      existing.suppliers.push(supplier);
+      continue;
+    }
+
+    grouped.set(row.internalSku, {
+      internalSku: row.internalSku,
+      productName: row.productName,
+      suppliers: [supplier],
+    });
+  }
+
+  return Array.from(grouped.values());
 }
