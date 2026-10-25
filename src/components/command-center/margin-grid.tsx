@@ -10,6 +10,7 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "@/components/ui/hover-card";
+import { Input } from "@/components/ui/input";
 import {
   Table,
   TableBody,
@@ -23,11 +24,19 @@ import { cn } from "@/lib/utils";
 type SupplierOffer = CommandCenterSku["suppliers"][number];
 type SkuGroup = CommandCenterSku;
 
+type LogisticsOverride = {
+  freightPct: number;
+  dutyPct: number;
+};
+
 type SupplierTlc = SupplierOffer & {
   baseFobZmw: number;
   freightZmw: number;
   dutyZmw: number;
   tlcZmw: number;
+  effectiveFreightPct: number;
+  effectiveDutyPct: number;
+  isOverridden: boolean;
 };
 
 type SkuTlcGroup = Omit<SkuGroup, "suppliers"> & {
@@ -35,16 +44,32 @@ type SkuTlcGroup = Omit<SkuGroup, "suppliers"> & {
   bestTlc: number;
 };
 
+function overrideKey(internalSku: string, supplierName: string) {
+  return `${internalSku}::${supplierName}`;
+}
+
+function ratesMatch(left: number, right: number) {
+  return Math.abs(left - right) < 1e-9;
+}
+
+function toDisplayPct(rate: number) {
+  return Number((rate * 100).toFixed(4));
+}
+
 function calculateTlc(
   supplier: SupplierOffer,
   currentFxRate: number,
+  override?: LogisticsOverride,
 ): SupplierTlc {
+  const effectiveFreightPct = override?.freightPct ?? supplier.freightPct;
+  const effectiveDutyPct = override?.dutyPct ?? supplier.dutyPct;
   const baseFobZmw = supplier.fobPriceUsd * currentFxRate;
-  const freightZmw = baseFobZmw * supplier.freightPct;
-  const dutyZmw = baseFobZmw * supplier.dutyPct;
+  const freightZmw = baseFobZmw * effectiveFreightPct;
+  const dutyZmw = baseFobZmw * effectiveDutyPct;
   const tlcZmw =
-    (supplier.fobPriceUsd * currentFxRate) *
-    (1 + supplier.freightPct + supplier.dutyPct);
+    supplier.fobPriceUsd *
+    currentFxRate *
+    (1 + effectiveFreightPct + effectiveDutyPct);
 
   return {
     ...supplier,
@@ -52,6 +77,9 @@ function calculateTlc(
     freightZmw,
     dutyZmw,
     tlcZmw,
+    effectiveFreightPct,
+    effectiveDutyPct,
+    isOverridden: Boolean(override),
   };
 }
 
@@ -69,26 +97,67 @@ function formatZmw(value: number) {
   })}`;
 }
 
-function formatPct(value: number) {
-  return `${(value * 100).toFixed(1)}%`;
+function formatMarginPct(value: number) {
+  return `${value.toFixed(1)}%`;
+}
+
+function MarginHealthBadge({
+  bestTlc,
+  retailPriceZmw,
+}: {
+  bestTlc: number;
+  retailPriceZmw?: number;
+}) {
+  if (retailPriceZmw == null || !Number.isFinite(retailPriceZmw)) {
+    return <Badge variant="secondary">No Baseline</Badge>;
+  }
+
+  const marginPct = ((retailPriceZmw - bestTlc) / retailPriceZmw) * 100;
+
+  if (marginPct < 0) {
+    return <Badge variant="destructive">{formatMarginPct(marginPct)}</Badge>;
+  }
+
+  if (marginPct <= 15) {
+    return (
+      <Badge className="border-transparent bg-amber-500/15 text-amber-800 dark:text-amber-400">
+        {formatMarginPct(marginPct)}
+      </Badge>
+    );
+  }
+
+  return (
+    <Badge className="border-transparent bg-emerald-500/15 text-emerald-800 dark:text-emerald-400">
+      {formatMarginPct(marginPct)}
+    </Badge>
+  );
 }
 
 export function MarginGrid({
+  baselinePrices,
   currentFxRate,
   data,
 }: {
+  baselinePrices: Record<string, number>;
   currentFxRate: number;
   data: SkuGroup[];
 }) {
   const [expandedSkus, setExpandedSkus] = useState<Set<string>>(
     () => new Set(),
   );
+  const [overrides, setOverrides] = useState<Record<string, LogisticsOverride>>(
+    {},
+  );
 
   const rows = useMemo(
     () =>
       data.map((group) => {
         const suppliers = group.suppliers.map((supplier) =>
-          calculateTlc(supplier, currentFxRate),
+          calculateTlc(
+            supplier,
+            currentFxRate,
+            overrides[overrideKey(group.internalSku, supplier.supplierName)],
+          ),
         );
         const bestTlc =
           suppliers.length === 0
@@ -101,7 +170,7 @@ export function MarginGrid({
           bestTlc,
         };
       }),
-    [currentFxRate, data],
+    [currentFxRate, data, overrides],
   );
 
   function toggleSku(internalSku: string) {
@@ -116,6 +185,40 @@ export function MarginGrid({
     });
   }
 
+  function updateOverride(
+    internalSku: string,
+    supplier: SupplierOffer,
+    field: keyof LogisticsOverride,
+    nextDisplayPct: number,
+  ) {
+    const key = overrideKey(internalSku, supplier.supplierName);
+    const current = overrides[key];
+    const nextFreightPct =
+      field === "freightPct"
+        ? nextDisplayPct / 100
+        : (current?.freightPct ?? supplier.freightPct);
+    const nextDutyPct =
+      field === "dutyPct"
+        ? nextDisplayPct / 100
+        : (current?.dutyPct ?? supplier.dutyPct);
+
+    setOverrides((existing) => {
+      const next = { ...existing };
+      if (
+        ratesMatch(nextFreightPct, supplier.freightPct) &&
+        ratesMatch(nextDutyPct, supplier.dutyPct)
+      ) {
+        delete next[key];
+      } else {
+        next[key] = {
+          freightPct: nextFreightPct,
+          dutyPct: nextDutyPct,
+        };
+      }
+      return next;
+    });
+  }
+
   return (
     <Table>
       <TableHeader>
@@ -124,13 +227,14 @@ export function MarginGrid({
           <TableHead>Internal SKU</TableHead>
           <TableHead>Product Name</TableHead>
           <TableHead>Suppliers Available</TableHead>
+          <TableHead>Margin Health</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.length === 0 ? (
           <TableRow>
             <TableCell
-              colSpan={4}
+              colSpan={5}
               className="py-10 text-center text-muted-foreground"
             >
               No active supplier pricing found.
@@ -143,8 +247,10 @@ export function MarginGrid({
             return (
               <SkuExpandableRows
                 key={group.internalSku}
+                baselineRetailPrice={baselinePrices[group.internalSku]}
                 group={group}
                 isExpanded={isExpanded}
+                onLogisticsChange={updateOverride}
                 onToggle={() => toggleSku(group.internalSku)}
               />
             );
@@ -156,12 +262,21 @@ export function MarginGrid({
 }
 
 function SkuExpandableRows({
+  baselineRetailPrice,
   group,
   isExpanded,
+  onLogisticsChange,
   onToggle,
 }: {
+  baselineRetailPrice?: number;
   group: SkuTlcGroup;
   isExpanded: boolean;
+  onLogisticsChange: (
+    internalSku: string,
+    supplier: SupplierOffer,
+    field: keyof LogisticsOverride,
+    nextDisplayPct: number,
+  ) => void;
   onToggle: () => void;
 }) {
   return (
@@ -195,10 +310,16 @@ function SkuExpandableRows({
             {group.suppliers.length === 1 ? "supplier" : "suppliers"}
           </Badge>
         </TableCell>
+        <TableCell>
+          <MarginHealthBadge
+            bestTlc={group.bestTlc}
+            retailPriceZmw={baselineRetailPrice}
+          />
+        </TableCell>
       </TableRow>
       {isExpanded ? (
         <TableRow className="hover:bg-transparent">
-          <TableCell colSpan={4} className="bg-muted/30 p-0 whitespace-normal">
+          <TableCell colSpan={5} className="bg-muted/30 p-0 whitespace-normal">
             <div className="px-4 py-3">
               <p className="mb-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
                 SKU cross-analysis · {group.internalSku}
@@ -222,7 +343,10 @@ function SkuExpandableRows({
                       <TableRow
                         key={supplier.supplierName}
                         className={cn(
-                          isBest &&
+                          supplier.isOverridden &&
+                            "bg-amber-400/20 hover:bg-amber-400/25",
+                          !supplier.isOverridden &&
+                            isBest &&
                             "bg-emerald-500/10 hover:bg-emerald-500/15",
                         )}
                       >
@@ -232,11 +356,33 @@ function SkuExpandableRows({
                         <TableCell className="text-right font-mono tabular-nums">
                           {formatUsd(supplier.fobPriceUsd)}
                         </TableCell>
-                        <TableCell className="text-right font-mono tabular-nums">
-                          {formatPct(supplier.freightPct)}
+                        <TableCell className="text-right">
+                          <LogisticsPctInput
+                            ariaLabel={`Freight percent for ${supplier.supplierName}`}
+                            value={toDisplayPct(supplier.effectiveFreightPct)}
+                            onValueChange={(next) =>
+                              onLogisticsChange(
+                                group.internalSku,
+                                supplier,
+                                "freightPct",
+                                next,
+                              )
+                            }
+                          />
                         </TableCell>
-                        <TableCell className="text-right font-mono tabular-nums">
-                          {formatPct(supplier.dutyPct)}
+                        <TableCell className="text-right">
+                          <LogisticsPctInput
+                            ariaLabel={`Duty percent for ${supplier.supplierName}`}
+                            value={toDisplayPct(supplier.effectiveDutyPct)}
+                            onValueChange={(next) =>
+                              onLogisticsChange(
+                                group.internalSku,
+                                supplier,
+                                "dutyPct",
+                                next,
+                              )
+                            }
+                          />
                         </TableCell>
                         <TableCell className="text-right">
                           <HoverCard>
@@ -291,5 +437,38 @@ function SkuExpandableRows({
         </TableRow>
       ) : null}
     </>
+  );
+}
+
+function LogisticsPctInput({
+  ariaLabel,
+  onValueChange,
+  value,
+}: {
+  ariaLabel: string;
+  onValueChange: (nextDisplayPct: number) => void;
+  value: number;
+}) {
+  return (
+    <div className="ml-auto flex w-24 items-center justify-end gap-1">
+      <Input
+        type="number"
+        min={0}
+        step={0.1}
+        value={Number.isFinite(value) ? value : ""}
+        aria-label={ariaLabel}
+        className="h-7 w-16 px-2 text-right font-mono text-xs tabular-nums"
+        onClick={(event) => event.stopPropagation()}
+        onKeyDown={(event) => event.stopPropagation()}
+        onChange={(event) => {
+          const next = event.target.valueAsNumber;
+          if (!Number.isFinite(next) || next < 0) {
+            return;
+          }
+          onValueChange(next);
+        }}
+      />
+      <span className="text-xs text-muted-foreground">%</span>
+    </div>
   );
 }
