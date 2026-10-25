@@ -1,6 +1,7 @@
 "use client";
 
-import { ArrowRight, Check, FileSpreadsheet, Loader2, UploadCloud } from "lucide-react";
+import { ArrowRight, Check, FileSpreadsheet, Loader2, Pencil, UploadCloud } from "lucide-react";
+import { useRouter } from "next/navigation";
 import Papa from "papaparse";
 import { useCallback, useState } from "react";
 import { useDropzone } from "react-dropzone";
@@ -9,6 +10,7 @@ import {
   generateAiMapping,
   type ColumnMapping,
 } from "@/app/actions/ai-mapping";
+import { saveMappingTemplate } from "@/app/actions/template-memory";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -19,6 +21,15 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   Table,
   TableBody,
@@ -30,6 +41,29 @@ import {
 import { cn } from "@/lib/utils";
 
 const SAMPLE_ROW_COUNT = 3;
+
+const MASTER_CATALOG_FIELDS = [
+  "internalSku",
+  "productName",
+  "category",
+  "benchmarkCost",
+  "retailPrice",
+  "minMarginPct",
+  "currentStock",
+] as const;
+
+const MAPPING_FIELD_OPTIONS = [...MASTER_CATALOG_FIELDS, "ignore"] as const;
+
+type MappingFieldOption = (typeof MAPPING_FIELD_OPTIONS)[number];
+
+const MAPPING_FIELD_ITEMS = MAPPING_FIELD_OPTIONS.map((field) => ({
+  label: field,
+  value: field,
+}));
+
+function isMappingFieldOption(value: string): value is MappingFieldOption {
+  return (MAPPING_FIELD_OPTIONS as readonly string[]).includes(value);
+}
 
 type MicroPayload = {
   fileName: string;
@@ -44,15 +78,25 @@ function confidenceVariant(confidence: number) {
 }
 
 export function DataUploader() {
+  const router = useRouter();
   const [payload, setPayload] = useState<MicroPayload | null>(null);
   const [parseError, setParseError] = useState<string | null>(null);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [mappings, setMappings] = useState<ColumnMapping[] | null>(null);
+  const [aiMappings, setAiMappings] = useState<ColumnMapping[] | null>(null);
+  const [activeMappings, setActiveMappings] = useState<ColumnMapping[] | null>(
+    null,
+  );
+  const [supplierName, setSupplierName] = useState("");
+  const [isSaving, setIsSaving] = useState(false);
   const [isTemplateSaved, setIsTemplateSaved] = useState(false);
+  const [saveMessage, setSaveMessage] = useState<string | null>(null);
 
   const resetAnalysis = useCallback(() => {
-    setMappings(null);
+    setAiMappings(null);
+    setActiveMappings(null);
     setIsTemplateSaved(false);
+    setIsSaving(false);
+    setSaveMessage(null);
   }, []);
 
   const parseCsv = useCallback(
@@ -127,7 +171,8 @@ export function DataUploader() {
       );
 
       if (result.success) {
-        setMappings(result.mappings);
+        setAiMappings(result.mappings);
+        setActiveMappings(result.mappings.map((mapping) => ({ ...mapping })));
       } else {
         setParseError(result.error);
       }
@@ -135,6 +180,51 @@ export function DataUploader() {
       setParseError("AI mapping failed. Please try again.");
     } finally {
       setIsAnalyzing(false);
+    }
+  }
+
+  function handleMappingChange(
+    index: number,
+    mappedDbField: MappingFieldOption,
+  ) {
+    setActiveMappings((current) => {
+      if (!current) return current;
+      return current.map((mapping, mappingIndex) =>
+        mappingIndex === index ? { ...mapping, mappedDbField } : mapping,
+      );
+    });
+    setIsTemplateSaved(false);
+    setSaveMessage(null);
+  }
+
+  function handleSupplierNameChange(value: string) {
+    setSupplierName(value);
+    setIsTemplateSaved(false);
+    setSaveMessage(null);
+  }
+
+  async function handleSaveMappingTemplate() {
+    const trimmedName = supplierName.trim();
+    if (!trimmedName || !activeMappings || isSaving) return;
+
+    setIsSaving(true);
+    setParseError(null);
+
+    try {
+      const result = await saveMappingTemplate(trimmedName, activeMappings);
+
+      if (result.success) {
+        setIsTemplateSaved(true);
+        setSaveMessage(`Template saved for ${trimmedName}`);
+        router.push("/command-center");
+        return;
+      }
+
+      setParseError(result.error);
+    } catch {
+      setParseError("Failed to save mapping template. Please try again.");
+    } finally {
+      setIsSaving(false);
     }
   }
 
@@ -191,7 +281,7 @@ export function DataUploader() {
         </CardContent>
       </Card>
 
-      {payload && !mappings ? (
+      {payload && !activeMappings ? (
         <Card>
           <CardHeader>
             <CardTitle>Micro-payload preview</CardTitle>
@@ -237,7 +327,7 @@ export function DataUploader() {
         </Card>
       ) : null}
 
-      {mappings ? (
+      {activeMappings ? (
         <Card>
           <CardHeader>
             <CardTitle>Proposed column mapping</CardTitle>
@@ -247,7 +337,22 @@ export function DataUploader() {
               this template.
             </CardDescription>
           </CardHeader>
-          <CardContent>
+          <CardContent className="space-y-4">
+            <div className="max-w-sm space-y-2">
+              <Label htmlFor="supplier-name">Supplier Name</Label>
+              <Input
+                id="supplier-name"
+                value={supplierName}
+                onChange={(event) => handleSupplierNameChange(event.target.value)}
+                placeholder="Apex, Vanguard"
+                required
+                autoComplete="off"
+                disabled={isSaving}
+              />
+              <p className="text-xs text-muted-foreground">
+                Required before you can save this mapping template.
+              </p>
+            </div>
             <Table>
               <TableHeader>
                 <TableRow>
@@ -259,55 +364,103 @@ export function DataUploader() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {mappings.map((mapping, index) => (
-                  <TableRow key={`${mapping.supplierHeader}-${index}`}>
-                    <TableCell className="font-medium">
-                      {mapping.supplierHeader}
-                    </TableCell>
-                    <TableCell>
-                      <ArrowRight className="size-4 text-muted-foreground" />
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        variant={
-                          mapping.mappedDbField === "ignore"
-                            ? "outline"
-                            : "secondary"
-                        }
-                      >
-                        {mapping.mappedDbField}
-                      </Badge>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant={confidenceVariant(mapping.confidence)}>
-                        {mapping.confidence}%
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="max-w-md text-muted-foreground">
-                      {mapping.reasoning}
-                    </TableCell>
-                  </TableRow>
-                ))}
+                {activeMappings.map((mapping, index) => {
+                  const isOverridden =
+                    mapping.mappedDbField !==
+                    aiMappings?.[index]?.mappedDbField;
+
+                  return (
+                    <TableRow key={`${mapping.supplierHeader}-${index}`}>
+                      <TableCell className="font-medium">
+                        {mapping.supplierHeader}
+                      </TableCell>
+                      <TableCell>
+                        <ArrowRight className="size-4 text-muted-foreground" />
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <Select
+                            items={MAPPING_FIELD_ITEMS}
+                            value={mapping.mappedDbField}
+                            onValueChange={(value) => {
+                              if (value === null || !isMappingFieldOption(value)) {
+                                return;
+                              }
+                              handleMappingChange(index, value);
+                            }}
+                          >
+                            <SelectTrigger
+                              className={cn(
+                                "min-w-44",
+                                isOverridden &&
+                                  "border-amber-500 text-amber-700 dark:text-amber-400",
+                              )}
+                              aria-label={`Map ${mapping.supplierHeader} to a database field`}
+                            >
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {MAPPING_FIELD_OPTIONS.map((field) => (
+                                <SelectItem key={field} value={field}>
+                                  {field}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          {isOverridden ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400"
+                              title="Manually overridden"
+                            >
+                              <Pencil className="size-3.5" />
+                              <span>Edited</span>
+                            </span>
+                          ) : null}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge variant={confidenceVariant(mapping.confidence)}>
+                          {mapping.confidence}%
+                        </Badge>
+                      </TableCell>
+                      <TableCell className="max-w-md text-muted-foreground">
+                        {mapping.reasoning}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
               </TableBody>
             </Table>
           </CardContent>
           <CardFooter className="justify-between gap-3">
-            {isTemplateSaved ? (
+            {parseError ? (
+              <p className="text-sm text-destructive" role="alert">
+                {parseError}
+              </p>
+            ) : saveMessage ? (
               <p className="text-sm text-muted-foreground" role="status">
-                Mapping template saved for this session.
+                {saveMessage}
               </p>
             ) : (
               <span />
             )}
             <Button
               size="lg"
-              disabled={isTemplateSaved}
-              onClick={() => setIsTemplateSaved(true)}
+              disabled={
+                !supplierName.trim() || isSaving || isTemplateSaved
+              }
+              onClick={handleSaveMappingTemplate}
             >
-              {isTemplateSaved ? <Check /> : null}
-              {isTemplateSaved
-                ? "Mapping Template Saved"
-                : "Confirm & Save Mapping Template"}
+              {isSaving ? (
+                <Loader2 className="animate-spin" />
+              ) : isTemplateSaved ? (
+                <Check />
+              ) : null}
+              {isSaving
+                ? "Saving…"
+                : isTemplateSaved
+                  ? "Mapping Template Saved"
+                  : "Confirm & Save Mapping Template"}
             </Button>
           </CardFooter>
         </Card>

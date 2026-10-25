@@ -1,4 +1,4 @@
-import { integer, numeric, pgTable, text, timestamp, uuid, varchar } from "drizzle-orm/pg-core";
+import { integer, jsonb, numeric, pgTable, text, timestamp, uuid, varchar } from "drizzle-orm/pg-core";
 
 export const usersTable = pgTable("users", {
   id: integer().primaryKey().generatedAlwaysAsIdentity(),
@@ -48,6 +48,13 @@ export const supplierConfigs = pgTable("supplier_configs", {
   freightFactorPct: numeric({ precision: 5, scale: 2 }).notNull(),
   importDutyPct: numeric({ precision: 5, scale: 2 }).notNull(),
   updatedAt: timestamp(),
+});
+
+export const supplierMappingTemplates = pgTable("supplier_mapping_templates", {
+  id: uuid().primaryKey().defaultRandom(),
+  supplierName: text().unique().notNull(),
+  mappings: jsonb().notNull(),
+  updatedAt: timestamp().defaultNow(),
 });
 
 export const exchangeRates = pgTable("exchange_rates", {
