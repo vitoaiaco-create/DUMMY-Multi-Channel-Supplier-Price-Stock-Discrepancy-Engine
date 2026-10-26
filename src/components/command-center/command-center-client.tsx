@@ -1,12 +1,13 @@
 "use client";
 
 import { CircleDollarSign, FileDown } from "lucide-react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import Papa from "papaparse";
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useState } from "react";
 
 import type { CommandCenterSku } from "@/app/actions/get-alerts";
 import {
+  commitBulkLogistics,
   commitLogisticsOverride,
   toggleScarcityPremium,
 } from "@/app/actions/overrides";
@@ -20,25 +21,24 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Slider } from "@/components/ui/slider";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import {
+  COMMAND_CENTER_FILTER_KEYS,
+  parseCurrencyMode,
+  parseMarginHealth,
+  type MarginHealthFilter,
+} from "@/lib/command-center-filters";
 import {
   formatFx,
+  formatUsd,
   getMarginHealthStatus,
   isBelowMinMargin,
   overrideKey,
   priceCommandCenterSku,
   ratesMatch,
   requiredRetailUsdForMinMargin,
-  type CurrencyMode,
   type LogisticsOverride,
   type MarginHealthStatus,
   type PricedSku,
@@ -47,6 +47,7 @@ import {
 } from "@/lib/command-center-pricing";
 
 const DEFAULT_FX = 27.5;
+const DEFAULT_CATALOG_FX = 25.5;
 const MIN_FX = 20;
 const MAX_FX = 35;
 const FX_STEP = 0.1;
@@ -63,26 +64,6 @@ const MASTER_EXPORT_HEADERS = [
   "current_warehouse_stock",
 ] as const;
 
-const MARGIN_HEALTH_ITEMS = [
-  { label: "All", value: "all" },
-  { label: "Below Min", value: "red" },
-  { label: "Below Target", value: "amber" },
-  { label: "On Target", value: "green" },
-] as const;
-
-type MarginHealthFilter = (typeof MARGIN_HEALTH_ITEMS)[number]["value"];
-
-function isMarginHealthFilter(value: unknown): value is MarginHealthFilter {
-  return (
-    typeof value === "string" &&
-    MARGIN_HEALTH_ITEMS.some((item) => item.value === value)
-  );
-}
-
-function isCurrencyMode(value: unknown): value is CurrencyMode {
-  return value === "USD" || value === "ZMW";
-}
-
 function matchesMarginHealth(row: PricedSku, filter: MarginHealthFilter) {
   if (filter === "all") {
     return true;
@@ -94,6 +75,56 @@ function matchesMarginHealth(row: PricedSku, filter: MarginHealthFilter) {
       row.minMarginPct,
       row.targetMarginPct,
     ) === (filter as MarginHealthStatus)
+  );
+}
+
+function matchesSkuSearch(group: PricedSku, skuSearch: string) {
+  if (skuSearch.trim() === "") {
+    return true;
+  }
+
+  return group.internalSku.toLowerCase().includes(skuSearch.trim().toLowerCase());
+}
+
+function matchesNameSearch(group: PricedSku, nameSearch: string) {
+  if (nameSearch === "") {
+    return true;
+  }
+
+  return group.productName.toLowerCase().includes(nameSearch.toLowerCase());
+}
+
+function bulkSupplierNames(row: PricedSku | CommandCenterSku | undefined) {
+  if (!row) {
+    return [];
+  }
+
+  const offerNames = [
+    ...new Set(
+      row.suppliers
+        .map((supplier) => supplier.supplierName.trim())
+        .filter(Boolean),
+    ),
+  ];
+  if (offerNames.length > 0) {
+    return offerNames;
+  }
+
+  return row.primarySupplier?.trim() ? [row.primarySupplier.trim()] : [];
+}
+
+function matchesSupplierSearch(group: PricedSku, supplierSearch: string) {
+  const query = supplierSearch.trim().toLowerCase();
+  if (query === "") {
+    return true;
+  }
+
+  if (group.primarySupplier?.toLowerCase().includes(query)) {
+    return true;
+  }
+
+  return group.suppliers.some((supplier) =>
+    supplier.supplierName.toLowerCase().includes(query),
   );
 }
 
@@ -118,12 +149,62 @@ function toMasterExportRow(row: PricedSku) {
   };
 }
 
+const AUDIT_REPORT_HEADERS = [
+  "Internal SKU",
+  "Product Name",
+  "Primary Supplier",
+  "Current Margin %",
+  "Current Warehouse Stock",
+  "Target Cost (USD)",
+  "Capital Exposure (USD)",
+] as const;
+
 function downloadCsv(filename: string, csv: string) {
   const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
   link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+function downloadAuditReport(failingSkus: PricedSku[]) {
+  const csvContent = Papa.unparse(
+    failingSkus.map((row) => {
+      const unitCost = row.targetCostUsd;
+      const stock = row.currentWarehouseStock;
+      const capitalExposure =
+        Number.isFinite(unitCost) && Number.isFinite(stock)
+          ? unitCost * stock
+          : Number.NaN;
+
+      return {
+        "Internal SKU": row.internalSku,
+        "Product Name": row.productName,
+        "Primary Supplier": row.primarySupplier ?? "",
+        "Current Margin %": toExportNumber(
+          row.currentMarginPct ?? Number.NaN,
+          1,
+        ),
+        "Current Warehouse Stock": stock,
+        "Target Cost (USD)": toExportNumber(unitCost),
+        "Capital Exposure (USD)": toExportNumber(capitalExposure),
+      };
+    }),
+    {
+      columns: [...AUDIT_REPORT_HEADERS],
+    },
+  );
+
+  const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = "Failing_SKUs_Audit_Report.csv";
+  link.style.display = "none";
   document.body.appendChild(link);
   link.click();
   link.remove();
@@ -199,9 +280,21 @@ export function CommandCenterClient({
   initialData: CommandCenterSku[];
 }) {
   const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+  const skuSearch = searchParams.get(COMMAND_CENTER_FILTER_KEYS.sku) ?? "";
+  const nameSearch = searchParams.get(COMMAND_CENTER_FILTER_KEYS.name) ?? "";
+  const supplierSearch =
+    searchParams.get(COMMAND_CENTER_FILTER_KEYS.supplier) ?? "";
+  const marginHealth = parseMarginHealth(
+    searchParams.get(COMMAND_CENTER_FILTER_KEYS.margin),
+  );
+  const currencyMode = parseCurrencyMode(
+    searchParams.get(COMMAND_CENTER_FILTER_KEYS.currency),
+  );
   const [fxRate, setFxRate] = useState(DEFAULT_FX);
-  const [currencyMode, setCurrencyMode] = useState<CurrencyMode>("ZMW");
-  const [marginHealth, setMarginHealth] = useState<MarginHealthFilter>("all");
+  const deferredFxRate = useDeferredValue(fxRate);
+  const [catalogFxRate, setCatalogFxRate] = useState(DEFAULT_CATALOG_FX);
   const [skuData, setSkuData] = useState(initialData);
   const [overrides, setOverrides] = useState<Record<string, LogisticsOverride>>(
     {},
@@ -216,30 +309,61 @@ export function CommandCenterClient({
   const [actionError, setActionError] = useState<string | null>(null);
   const [isExporting, setIsExporting] = useState(false);
   const [isCommittingReprice, setIsCommittingReprice] = useState(false);
+  const [isCommittingLogistics, setIsCommittingLogistics] = useState(false);
+  const [selectedSkus, setSelectedSkus] = useState<string[]>([]);
+  const [flatFreightOverride, setFlatFreightOverride] = useState("");
+  const [flatDutyOverride, setFlatDutyOverride] = useState("");
 
   useEffect(() => {
     setSkuData(initialData);
   }, [initialData]);
 
   const pricedRows = useMemo(
-    () => skuData.map((sku) => priceCommandCenterSku(sku, fxRate, overrides)),
-    [fxRate, overrides, skuData],
+    () =>
+      skuData.map((sku) =>
+        priceCommandCenterSku(sku, deferredFxRate, overrides, catalogFxRate),
+      ),
+    [catalogFxRate, deferredFxRate, overrides, skuData],
   );
 
-  const filteredData = useMemo(() => {
-    if (marginHealth === "all") {
-      return pricedRows;
-    }
+  const filteredData = useMemo(
+    () =>
+      pricedRows.filter(
+        (group) =>
+          matchesMarginHealth(group, marginHealth) &&
+          matchesSkuSearch(group, skuSearch) &&
+          matchesNameSearch(group, nameSearch) &&
+          matchesSupplierSearch(group, supplierSearch),
+      ),
+    [marginHealth, nameSearch, pricedRows, skuSearch, supplierSearch],
+  );
 
-    return pricedRows.filter((sku) => matchesMarginHealth(sku, marginHealth));
-  }, [marginHealth, pricedRows]);
-
-  const underperformingInView = useMemo(
+  const failingSkus = useMemo(
     () => filteredData.filter(isBelowMinMargin),
     [filteredData],
   );
 
+  const capitalAtRiskUsd = useMemo(
+    () =>
+      failingSkus.reduce((sum, row) => {
+        const unitCost = row.targetCostUsd;
+        const stock = row.currentWarehouseStock;
+        if (!Number.isFinite(unitCost) || !Number.isFinite(stock)) {
+          return sum;
+        }
+        return sum + unitCost * stock;
+      }, 0),
+    [failingSkus],
+  );
+
   const stagedCount = Object.keys(stagedPriceUpdates).length;
+
+  function isolateFailingSkus() {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set(COMMAND_CENTER_FILTER_KEYS.margin, "red");
+    const query = params.toString();
+    router.push(query ? `${pathname}?${query}` : pathname, { scroll: false });
+  }
 
   function updateOverride(
     internalSku: string,
@@ -372,14 +496,15 @@ export function CommandCenterClient({
     }
   }
 
-  function handleRepriceToMinimum() {
+  function handleStagePreemptiveReprice() {
     const next: Record<string, number> = {};
 
-    for (const row of underperformingInView) {
+    for (const row of failingSkus) {
+      const bestTlcZmw = row.bestTlcUsd * fxRate;
       const requiredUsd = requiredRetailUsdForMinMargin(
-        row.bestTlc,
+        bestTlcZmw,
         row.minMarginPct,
-        fxRate,
+        catalogFxRate,
       );
       if (requiredUsd == null) {
         continue;
@@ -388,6 +513,90 @@ export function CommandCenterClient({
     }
 
     setStagedPriceUpdates(next);
+  }
+
+  function toggleSkuSelection(internalSku: string) {
+    setSelectedSkus((current) =>
+      current.includes(internalSku)
+        ? current.filter((sku) => sku !== internalSku)
+        : [...current, internalSku],
+    );
+  }
+
+  function selectAllVisibleSkus(selected: boolean) {
+    const visibleSkus = filteredData.map((row) => row.internalSku);
+    setSelectedSkus((current) => {
+      const next = new Set(current);
+      if (selected) {
+        for (const sku of visibleSkus) {
+          next.add(sku);
+        }
+      } else {
+        for (const sku of visibleSkus) {
+          next.delete(sku);
+        }
+      }
+      return Array.from(next);
+    });
+  }
+
+  async function handleCommitLogistics() {
+    const parsedFreight =
+      flatFreightOverride.trim() === ""
+        ? undefined
+        : Number(flatFreightOverride);
+    const parsedDuty =
+      flatDutyOverride.trim() === "" ? undefined : Number(flatDutyOverride);
+
+    if (
+      (parsedFreight == null || !Number.isFinite(parsedFreight)) &&
+      (parsedDuty == null || !Number.isFinite(parsedDuty))
+    ) {
+      setActionError("Enter a freight or duty override before committing.");
+      return;
+    }
+
+    const payload = selectedSkus.flatMap((sku) => {
+      const row =
+        filteredData.find((item) => item.internalSku === sku) ??
+        skuData.find((item) => item.internalSku === sku);
+
+      return bulkSupplierNames(row).map((supplierName) => ({
+        internalSku: sku,
+        supplierName,
+        freightPct: parsedFreight,
+        dutyPct: parsedDuty,
+      }));
+    });
+
+    if (payload.length === 0) {
+      setActionError("Selected SKUs are missing a supplier to override.");
+      return;
+    }
+
+    setActionError(null);
+    setIsCommittingLogistics(true);
+
+    try {
+      const result = await commitBulkLogistics(payload);
+      if (!result.success) {
+        setActionError(result.error);
+        return;
+      }
+
+      setSelectedSkus([]);
+      setFlatFreightOverride("");
+      setFlatDutyOverride("");
+      router.refresh();
+    } catch (error) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Failed to commit logistics overrides. Please try again.",
+      );
+    } finally {
+      setIsCommittingLogistics(false);
+    }
   }
 
   async function handleCommitPriceHikes() {
@@ -446,14 +655,46 @@ export function CommandCenterClient({
 
       <Card>
         <CardHeader className="border-b">
-          <CardTitle>FX stress control</CardTitle>
+          <CardTitle>Macro Stress Dashboard</CardTitle>
           <CardDescription>
-            Drag the USD/ZMW rate to recalculate True Landed Cost and the best
-            supplier for every SKU.
+            Hold catalog retail at the baseline FX while the stress rate
+            reprices True Landed Cost. Failing SKUs and capital at risk update
+            with the filtered workspace.
           </CardDescription>
         </CardHeader>
         <CardContent className="pt-(--card-spacing)">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-end">
+          <div
+            className={
+              failingSkus.length > 0
+                ? "rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-950 dark:text-amber-100"
+                : "rounded-xl border bg-muted/50 px-4 py-3 text-sm text-muted-foreground"
+            }
+            role="status"
+          >
+            ⚠️{" "}
+            <Button
+              type="button"
+              variant="link"
+              className="h-auto p-0 font-semibold text-inherit underline-offset-4 hover:text-primary hover:underline"
+              onClick={isolateFailingSkus}
+              aria-label="Filter workspace to failing SKUs below minimum margin"
+            >
+              {failingSkus.length} Failing SKUs
+            </Button>{" "}
+            below minimum margin. Capital at risk:{" "}
+            <Button
+              type="button"
+              variant="link"
+              className="h-auto p-0 font-semibold tabular-nums text-inherit underline-offset-4 hover:text-primary hover:underline"
+              disabled={failingSkus.length === 0}
+              onClick={() => downloadAuditReport(failingSkus)}
+              aria-label="Download failing SKUs audit report"
+            >
+              {formatUsd(capitalAtRiskUsd)}
+            </Button>
+            .
+          </div>
+          <div className="mt-6 flex flex-col gap-6 lg:flex-row lg:items-end">
             <div className="min-w-0 flex-1 space-y-3">
               <div className="flex items-center justify-between gap-3">
                 <Label htmlFor="fx-rate-slider">USD / ZMW</Label>
@@ -477,6 +718,24 @@ export function CommandCenterClient({
               />
             </div>
             <div className="flex flex-wrap items-end gap-3">
+              <div className="w-40 space-y-2">
+                <Label htmlFor="catalog-fx-rate">Catalog Baseline FX</Label>
+                <Input
+                  id="catalog-fx-rate"
+                  type="number"
+                  min={1}
+                  step={0.01}
+                  value={catalogFxRate}
+                  aria-label="Catalog Baseline FX"
+                  className="font-mono tabular-nums"
+                  onChange={(event) => {
+                    const next = event.target.valueAsNumber;
+                    if (Number.isFinite(next) && next > 0) {
+                      setCatalogFxRate(next);
+                    }
+                  }}
+                />
+              </div>
               <div className="shrink-0 rounded-xl bg-muted/60 px-5 py-3 text-right sm:min-w-40">
                 <p className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
                   Live FX rate
@@ -485,59 +744,16 @@ export function CommandCenterClient({
                   {formatFx(fxRate)}
                 </p>
               </div>
-              <div className="space-y-2">
-                <Label htmlFor="currency-view">Currency View</Label>
-                <Tabs
-                  value={currencyMode}
-                  onValueChange={(value) => {
-                    if (isCurrencyMode(value)) {
-                      setCurrencyMode(value);
-                    }
-                  }}
-                >
-                  <TabsList id="currency-view" aria-label="Currency view">
-                    <TabsTrigger value="ZMW">ZMW</TabsTrigger>
-                    <TabsTrigger value="USD">USD</TabsTrigger>
-                  </TabsList>
-                </Tabs>
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="margin-health-filter">Margin Health</Label>
-                <Select
-                  items={[...MARGIN_HEALTH_ITEMS]}
-                  value={marginHealth}
-                  onValueChange={(value) => {
-                    if (isMarginHealthFilter(value)) {
-                      setMarginHealth(value);
-                    }
-                  }}
-                >
-                  <SelectTrigger
-                    id="margin-health-filter"
-                    className="min-w-52"
-                    aria-label="Filter SKUs by margin health"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {MARGIN_HEALTH_ITEMS.map((item) => (
-                      <SelectItem key={item.value} value={item.value}>
-                        {item.label}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
               <Button
                 variant="outline"
                 disabled={
                   isExporting ||
                   isCommittingReprice ||
-                  underperformingInView.length === 0
+                  failingSkus.length === 0
                 }
-                onClick={handleRepriceToMinimum}
+                onClick={handleStagePreemptiveReprice}
               >
-                Reprice to Minimum
+                Stage Preemptive Reprice
               </Button>
               {stagedCount > 0 ? (
                 <Button
@@ -572,24 +788,86 @@ export function CommandCenterClient({
         </CardContent>
       </Card>
 
+      {selectedSkus.length > 0 ? (
+        <Card>
+          <CardHeader className="border-b">
+            <CardTitle>Bulk Logistics Panel</CardTitle>
+            <CardDescription>
+              {selectedSkus.length} SKUs Selected
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="pt-(--card-spacing)">
+            <div className="flex flex-col gap-4 sm:flex-row sm:flex-wrap sm:items-end">
+              <div className="w-full space-y-2 sm:w-48">
+                <Label htmlFor="flat-freight-override">
+                  Flat Freight Override (%)
+                </Label>
+                <Input
+                  id="flat-freight-override"
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={flatFreightOverride}
+                  aria-label="Flat Freight Override (%)"
+                  className="font-mono tabular-nums"
+                  onChange={(event) =>
+                    setFlatFreightOverride(event.target.value)
+                  }
+                />
+              </div>
+              <div className="w-full space-y-2 sm:w-48">
+                <Label htmlFor="flat-duty-override">
+                  Flat Duty Override (%)
+                </Label>
+                <Input
+                  id="flat-duty-override"
+                  type="number"
+                  min={0}
+                  step={0.1}
+                  value={flatDutyOverride}
+                  aria-label="Flat Duty Override (%)"
+                  className="font-mono tabular-nums"
+                  onChange={(event) => setFlatDutyOverride(event.target.value)}
+                />
+              </div>
+              <Button
+                type="button"
+                disabled={isCommittingLogistics}
+                onClick={() => {
+                  void handleCommitLogistics();
+                }}
+              >
+                {isCommittingLogistics
+                  ? "Committing..."
+                  : "Commit Logistics Overrides"}
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      ) : null}
+
       <Card>
         <CardHeader className="border-b">
           <CardTitle>SKU cross-analysis</CardTitle>
           <CardDescription>
-            Expand a SKU to compare supplier True Landed Cost at the current FX
-            rate. Hover a TLC value for the freight and duty breakdown.
+            Expand a SKU to compare supplier True Landed Cost at the current
+            FX rate. Hover a TLC value for the freight and duty breakdown.
           </CardDescription>
         </CardHeader>
         <CardContent className="overflow-x-auto p-0">
           <MarginGrid
+            catalogFxRate={catalogFxRate}
             committingKey={committingKey}
             currencyMode={currencyMode}
-            currentFxRate={fxRate}
+            currentFxRate={deferredFxRate}
             rows={filteredData}
             scarcityPendingSku={scarcityPendingSku}
+            selectedSkus={selectedSkus}
             stagedPriceUpdates={stagedPriceUpdates}
+            toggleSkuSelection={toggleSkuSelection}
             onCommitOverride={handleCommitOverride}
             onLogisticsChange={updateOverride}
+            onSelectAllVisible={selectAllVisibleSkus}
             onToggleScarcity={handleToggleScarcity}
           />
         </CardContent>

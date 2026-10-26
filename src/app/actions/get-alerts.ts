@@ -98,40 +98,64 @@ function toRateDecimal(value: string | number | null | undefined): number {
   return toNumber(value) / 100;
 }
 
+type LogisticsOverrideRates = {
+  freightPct?: number;
+  dutyPct?: number;
+};
+
 export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
-  const [rows, skuOverrides] = await Promise.all([
-    db
-      .select({
-        internalSku: masterCatalog.internalSku,
-        productName: masterCatalog.productName,
-        category: masterCatalog.category,
-        targetCostUsd: masterCatalog.targetCostUsd,
-        retailPriceUsd: masterCatalog.retailPriceUsd,
-        targetMarginPct: masterCatalog.targetMarginPct,
-        minMarginPct: masterCatalog.minMarginPct,
-        primarySupplier: masterCatalog.primarySupplier,
-        currentWarehouseStock: masterCatalog.currentWarehouseStock,
-        scarcityPremiumActive: masterCatalog.scarcityPremiumActive,
-        scarcityReviewDate: masterCatalog.scarcityReviewDate,
-        supplierCode: marginAlerts.supplierCode,
-        fobPriceUsd: marginAlerts.supplierFobCostUsd,
-        freightPct: supplierConfigs.freightPct,
-        dutyPct: supplierConfigs.dutyPct,
-        freightFactorPct: supplierConfigs.freightFactorPct,
-        importDutyPct: supplierConfigs.importDutyPct,
-      })
-      .from(masterCatalog)
-      .innerJoin(
-        marginAlerts,
-        eq(masterCatalog.internalSku, marginAlerts.internalSku),
-      )
-      .leftJoin(
-        supplierConfigs,
-        eq(marginAlerts.supplierCode, supplierConfigs.supplierCode),
-      )
-      .orderBy(asc(masterCatalog.internalSku)),
-    getLatestSkuLogisticsOverrides(),
-  ]);
+  const allOverrides = await getLatestSkuLogisticsOverrides();
+
+  const overridesDict: Record<string, LogisticsOverrideRates> = {};
+  for (const override of allOverrides) {
+    if (!override.internalSku) {
+      continue;
+    }
+
+    const key = `${override.internalSku}-${override.supplierName}`;
+    const current = overridesDict[key] ?? {};
+
+    // Query is DESC createdAt, so keep the first freight and first duty per SKU/supplier.
+    if (override.changedField === "freight" && current.freightPct == null) {
+      current.freightPct = toRateDecimal(override.newValue);
+    }
+    if (override.changedField === "duty" && current.dutyPct == null) {
+      current.dutyPct = toRateDecimal(override.newValue);
+    }
+
+    overridesDict[key] = current;
+  }
+
+  const rows = await db
+    .select({
+      internalSku: masterCatalog.internalSku,
+      productName: masterCatalog.productName,
+      category: masterCatalog.category,
+      targetCostUsd: masterCatalog.targetCostUsd,
+      retailPriceUsd: masterCatalog.retailPriceUsd,
+      targetMarginPct: masterCatalog.targetMarginPct,
+      minMarginPct: masterCatalog.minMarginPct,
+      primarySupplier: masterCatalog.primarySupplier,
+      currentWarehouseStock: masterCatalog.currentWarehouseStock,
+      scarcityPremiumActive: masterCatalog.scarcityPremiumActive,
+      scarcityReviewDate: masterCatalog.scarcityReviewDate,
+      supplierCode: marginAlerts.supplierCode,
+      fobPriceUsd: marginAlerts.supplierFobCostUsd,
+      freightPct: supplierConfigs.freightPct,
+      dutyPct: supplierConfigs.dutyPct,
+      freightFactorPct: supplierConfigs.freightFactorPct,
+      importDutyPct: supplierConfigs.importDutyPct,
+    })
+    .from(masterCatalog)
+    .innerJoin(
+      marginAlerts,
+      eq(masterCatalog.internalSku, marginAlerts.internalSku),
+    )
+    .leftJoin(
+      supplierConfigs,
+      eq(marginAlerts.supplierCode, supplierConfigs.supplierCode),
+    )
+    .orderBy(asc(masterCatalog.internalSku));
 
   const grouped = new Map<string, CommandCenterSku>();
 
@@ -141,16 +165,24 @@ export async function getCommandCenterData(): Promise<CommandCenterSku[]> {
     }
 
     const supplierName = formatSupplierName(row.supplierCode);
-    const committed = skuOverrides.get(`${row.internalSku}::${supplierName}`);
+    const skuOverride =
+      overridesDict[`${row.internalSku}-${supplierName}`] ??
+      overridesDict[`${row.internalSku}-${row.supplierCode}`] ??
+      (row.primarySupplier
+        ? (overridesDict[
+            `${row.internalSku}-${formatSupplierName(row.primarySupplier)}`
+          ] ??
+          overridesDict[`${row.internalSku}-${row.primarySupplier}`])
+        : undefined);
     const supplier: CommandCenterSupplier = {
       supplierName,
       supplierCode: row.supplierCode,
       fobPriceUsd: toNumber(row.fobPriceUsd),
       freightPct:
-        committed?.freightPct ??
+        skuOverride?.freightPct ??
         toRateDecimal(row.freightPct ?? row.freightFactorPct),
       dutyPct:
-        committed?.dutyPct ?? toRateDecimal(row.dutyPct ?? row.importDutyPct),
+        skuOverride?.dutyPct ?? toRateDecimal(row.dutyPct ?? row.importDutyPct),
     };
 
     const existing = grouped.get(row.internalSku);

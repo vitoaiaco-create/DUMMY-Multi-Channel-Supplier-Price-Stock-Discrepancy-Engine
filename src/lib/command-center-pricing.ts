@@ -127,9 +127,9 @@ export function applyScarcityPremium(tlcZmw: number, isActive: boolean) {
 
 export function calculateLiveRetailZmw(
   retailPriceUsd: number,
-  currentFxRate: number,
+  catalogFxRate: number,
 ) {
-  return retailPriceUsd * currentFxRate;
+  return retailPriceUsd * catalogFxRate;
 }
 
 export function calculateCurrentMarginPct(
@@ -167,6 +167,7 @@ export function priceCommandCenterSku(
   sku: CommandCenterSku,
   currentFxRate: number,
   overrides: Record<string, LogisticsOverride>,
+  catalogFxRate: number,
 ): PricedSku {
   const suppliers = sku.suppliers.map((supplier) =>
     calculateTlc(
@@ -175,23 +176,23 @@ export function priceCommandCenterSku(
       overrides[overrideKey(sku.internalSku, supplier.supplierName)],
     ),
   );
-  const bestTlc =
-    suppliers.length === 0
-      ? Number.POSITIVE_INFINITY
-      : Math.min(...suppliers.map((supplier) => supplier.tlcZmw));
   const bestSupplier =
-    suppliers.find((supplier) => supplier.tlcZmw === bestTlc) ?? null;
-  const liveRetailZmw = calculateLiveRetailZmw(
-    sku.retailPriceUsd,
-    currentFxRate,
-  );
+    suppliers.reduce<SupplierTlc | null>((currentBest, supplier) => {
+      if (currentBest == null || supplier.tlcZmw < currentBest.tlcZmw) {
+        return supplier;
+      }
+      return currentBest;
+    }, null);
   const bestTlcUsd =
     bestSupplier != null
       ? bestSupplier.fobPriceUsd *
         (1 + bestSupplier.effectiveFreightPct + bestSupplier.effectiveDutyPct)
-      : currentFxRate > 0 && Number.isFinite(bestTlc)
-        ? bestTlc / currentFxRate
-        : 0;
+      : 0;
+  const bestTlc = bestTlcUsd * currentFxRate;
+  const liveRetailZmw = calculateLiveRetailZmw(
+    sku.retailPriceUsd,
+    catalogFxRate,
+  );
 
   return {
     ...sku,
@@ -235,21 +236,21 @@ export function isBelowMinMargin(row: Pick<PricedSku, "currentMarginPct" | "minM
 export function requiredRetailUsdForMinMargin(
   bestTlcZmw: number,
   minMarginPct: number,
-  currentFxRate: number,
+  catalogFxRate: number,
 ) {
   if (
     !Number.isFinite(bestTlcZmw) ||
     bestTlcZmw <= 0 ||
     !Number.isFinite(minMarginPct) ||
     minMarginPct >= 100 ||
-    !Number.isFinite(currentFxRate) ||
-    currentFxRate <= 0
+    !Number.isFinite(catalogFxRate) ||
+    catalogFxRate <= 0
   ) {
     return null;
   }
 
   const requiredRetailZmw = bestTlcZmw / (1 - minMarginPct / 100);
-  const requiredRetailUsd = requiredRetailZmw / currentFxRate;
+  const requiredRetailUsd = requiredRetailZmw / catalogFxRate;
 
   if (!Number.isFinite(requiredRetailUsd) || requiredRetailUsd <= 0) {
     return null;

@@ -1,7 +1,7 @@
 "use server";
 
 import { auth } from "@clerk/nextjs/server";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, inArray } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
 
 import { db } from "@/db";
@@ -73,6 +73,79 @@ async function findSupplierConfig(supplierName: string) {
 
 function normalizeSupplierName(supplierCode: string) {
   return normalizeSupplierKey(formatSupplierName(supplierCode));
+}
+
+function supplierIdentityKeys(supplierName: string) {
+  return new Set(
+    [supplierName, formatSupplierName(supplierName)]
+      .map((value) => normalizeSupplierKey(value))
+      .filter(Boolean),
+  );
+}
+
+function suppliersMatch(left: string, right: string) {
+  const rightKeys = supplierIdentityKeys(right);
+  for (const key of supplierIdentityKeys(left)) {
+    if (rightKeys.has(key)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function findSupplierConfigIn(
+  rows: (typeof supplierConfigs.$inferSelect)[],
+  supplierName: string,
+) {
+  const targetKeys = supplierIdentityKeys(supplierName);
+  return (
+    rows.find((row) => {
+      return (
+        targetKeys.has(normalizeSupplierKey(row.supplierCode)) ||
+        targetKeys.has(normalizeSupplierName(row.supplierCode))
+      );
+    }) ?? null
+  );
+}
+
+function toStoredPct(value: string | number) {
+  return toNumber(value).toFixed(2);
+}
+
+function resolveOldPct(
+  latestValue: string | null | undefined,
+  config: typeof supplierConfigs.$inferSelect | null,
+  field: "freight" | "duty",
+) {
+  if (latestValue != null && latestValue !== "") {
+    return toStoredPct(latestValue);
+  }
+  if (!config) {
+    return "0.00";
+  }
+
+  const current =
+    field === "freight"
+      ? resolveConfigRate(config.freightPct, config.freightFactorPct)
+      : resolveConfigRate(config.dutyPct, config.importDutyPct);
+
+  return current.toFixed(2);
+}
+
+function latestSkuFieldValue(
+  rows: SkuLogisticsOverrideRow[],
+  internalSku: string,
+  supplierName: string,
+  changedField: "freight" | "duty",
+) {
+  const match = rows.find(
+    (row) =>
+      row.internalSku === internalSku &&
+      row.changedField === changedField &&
+      suppliersMatch(row.supplierName, supplierName),
+  );
+
+  return match?.newValue ?? null;
 }
 
 function resolveConfigRate(
@@ -215,8 +288,142 @@ export async function toggleScarcityPremium(
   }
 }
 
-export async function getLatestSkuLogisticsOverrides() {
-  const rows = await db
+export type BulkLogisticsUpdate = {
+  internalSku: string;
+  supplierName: string;
+  freightPct?: number;
+  dutyPct?: number;
+};
+
+export type SkuLogisticsOverrideRow = {
+  supplierName: string;
+  internalSku: string | null;
+  changedField: string;
+  newValue: string;
+  createdAt: Date | null;
+};
+
+export async function commitBulkLogistics(
+  updates: BulkLogisticsUpdate[],
+): Promise<OverrideActionResult> {
+  try {
+    const userId = await requireUserId();
+    const insertData: (typeof overrideAuditLog.$inferInsert)[] = [];
+    const skuList = [
+      ...new Set(
+        updates.map((update) => update.internalSku.trim()).filter(Boolean),
+      ),
+    ];
+
+    const [existingLogs, configs] = await Promise.all([
+      skuList.length === 0
+        ? Promise.resolve([] as SkuLogisticsOverrideRow[])
+        : db
+            .select({
+              supplierName: overrideAuditLog.supplierName,
+              internalSku: overrideAuditLog.internalSku,
+              changedField: overrideAuditLog.changedField,
+              newValue: overrideAuditLog.newValue,
+              createdAt: overrideAuditLog.createdAt,
+            })
+            .from(overrideAuditLog)
+            .where(inArray(overrideAuditLog.internalSku, skuList))
+            .orderBy(desc(overrideAuditLog.createdAt)),
+      db.select().from(supplierConfigs),
+    ]);
+
+    for (const update of updates) {
+      const internalSku = update.internalSku.trim();
+      const rawSupplierName = update.supplierName.trim();
+      const supplierName = formatSupplierName(rawSupplierName) || rawSupplierName;
+
+      if (!internalSku) {
+        return {
+          success: false,
+          error: "Each logistics update requires an internal SKU.",
+        };
+      }
+      if (!supplierName) {
+        return {
+          success: false,
+          error: `A supplier is required for ${internalSku}.`,
+        };
+      }
+
+      const config = findSupplierConfigIn(configs, supplierName);
+      const lookupName = rawSupplierName || supplierName;
+
+      if (update.freightPct != null) {
+        if (!Number.isFinite(update.freightPct) || update.freightPct < 0) {
+          return {
+            success: false,
+            error: `Freight percent for ${internalSku} must be a positive number.`,
+          };
+        }
+
+        insertData.push({
+          supplierName,
+          internalSku,
+          changedField: "freight",
+          oldValue: resolveOldPct(
+            latestSkuFieldValue(existingLogs, internalSku, lookupName, "freight"),
+            config,
+            "freight",
+          ),
+          newValue: toStoredPct(update.freightPct),
+          userId,
+        });
+      }
+
+      if (update.dutyPct != null) {
+        if (!Number.isFinite(update.dutyPct) || update.dutyPct < 0) {
+          return {
+            success: false,
+            error: `Duty percent for ${internalSku} must be a positive number.`,
+          };
+        }
+
+        insertData.push({
+          supplierName,
+          internalSku,
+          changedField: "duty",
+          oldValue: resolveOldPct(
+            latestSkuFieldValue(existingLogs, internalSku, lookupName, "duty"),
+            config,
+            "duty",
+          ),
+          newValue: toStoredPct(update.dutyPct),
+          userId,
+        });
+      }
+    }
+
+    if (insertData.length === 0) {
+      return {
+        success: false,
+        error: "Enter a freight or duty override before committing.",
+      };
+    }
+
+    await db.insert(overrideAuditLog).values(insertData);
+    revalidatePath("/command-center");
+    return { success: true };
+  } catch (error) {
+    console.error("[commitBulkLogistics]", error);
+    return {
+      success: false,
+      error:
+        error instanceof Error && error.message === "Unauthorized"
+          ? "You must be signed in to commit overrides."
+          : "Failed to commit bulk logistics overrides. Please try again.",
+    };
+  }
+}
+
+export async function getLatestSkuLogisticsOverrides(): Promise<
+  SkuLogisticsOverrideRow[]
+> {
+  return db
     .select({
       supplierName: overrideAuditLog.supplierName,
       internalSku: overrideAuditLog.internalSku,
@@ -226,26 +433,4 @@ export async function getLatestSkuLogisticsOverrides() {
     })
     .from(overrideAuditLog)
     .orderBy(desc(overrideAuditLog.createdAt));
-
-  const latest = new Map<string, { freightPct?: number; dutyPct?: number }>();
-
-  for (const row of rows) {
-    if (!row.internalSku) {
-      continue;
-    }
-
-    const key = `${row.internalSku}::${row.supplierName}`;
-    const current = latest.get(key) ?? {};
-
-    if (row.changedField === "freight" && current.freightPct == null) {
-      current.freightPct = toNumber(row.newValue) / 100;
-    }
-    if (row.changedField === "duty" && current.dutyPct == null) {
-      current.dutyPct = toNumber(row.newValue) / 100;
-    }
-
-    latest.set(key, current);
-  }
-
-  return latest;
 }

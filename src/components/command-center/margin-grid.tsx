@@ -6,6 +6,7 @@ import { useState } from "react";
 import type { CommandCenterSku } from "@/app/actions/get-alerts";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   HoverCard,
   HoverCardContent,
@@ -33,7 +34,6 @@ import {
   getMarginHealthStatus,
   toDisplayCurrency,
   toDisplayPct,
-  tlcToDisplayCurrency,
   type CurrencyMode,
   type LogisticsOverride,
   type PricedSku,
@@ -127,16 +127,21 @@ function BreakevenFxCell({
 }
 
 export function MarginGrid({
+  catalogFxRate,
   committingKey,
   currencyMode,
   currentFxRate,
   onCommitOverride,
   onLogisticsChange,
+  onSelectAllVisible,
   onToggleScarcity,
   rows,
   scarcityPendingSku,
+  selectedSkus,
   stagedPriceUpdates,
+  toggleSkuSelection,
 }: {
+  catalogFxRate: number;
   committingKey: string | null;
   currencyMode: CurrencyMode;
   currentFxRate: number;
@@ -147,14 +152,26 @@ export function MarginGrid({
     field: keyof LogisticsOverride,
     nextDisplayPct: number,
   ) => void;
+  onSelectAllVisible: (selected: boolean) => void;
   onToggleScarcity: (sku: CommandCenterSku, isActive: boolean) => void;
   rows: PricedSku[];
   scarcityPendingSku: string | null;
+  selectedSkus: string[];
   stagedPriceUpdates: Record<string, number>;
+  toggleSkuSelection: (internalSku: string) => void;
 }) {
   const [expandedSkus, setExpandedSkus] = useState<Set<string>>(
     () => new Set(),
   );
+  const selectedSkuSet = new Set(selectedSkus);
+  const selectedVisibleCount = rows.reduce(
+    (count, row) => count + (selectedSkuSet.has(row.internalSku) ? 1 : 0),
+    0,
+  );
+  const allVisibleSelected =
+    rows.length > 0 && selectedVisibleCount === rows.length;
+  const someVisibleSelected =
+    selectedVisibleCount > 0 && selectedVisibleCount < rows.length;
 
   function toggleSku(internalSku: string) {
     setExpandedSkus((current) => {
@@ -172,6 +189,15 @@ export function MarginGrid({
     <Table>
       <TableHeader>
         <TableRow>
+          <TableHead className="w-10">
+            <Checkbox
+              checked={allVisibleSelected}
+              disabled={rows.length === 0}
+              indeterminate={someVisibleSelected}
+              aria-label="Select all currently visible SKUs"
+              onCheckedChange={(checked) => onSelectAllVisible(Boolean(checked))}
+            />
+          </TableHead>
           <TableHead className="w-10" />
           <TableHead>Internal SKU</TableHead>
           <TableHead>Product Name</TableHead>
@@ -202,7 +228,7 @@ export function MarginGrid({
         {rows.length === 0 ? (
           <TableRow>
             <TableCell
-              colSpan={16}
+              colSpan={17}
               className="py-10 text-center text-muted-foreground"
             >
               No active supplier pricing found.
@@ -215,17 +241,20 @@ export function MarginGrid({
             return (
               <SkuExpandableRows
                 key={group.internalSku}
+                catalogFxRate={catalogFxRate}
                 committingKey={committingKey}
                 currencyMode={currencyMode}
                 currentFxRate={currentFxRate}
                 group={group}
                 isExpanded={isExpanded}
+                isSelected={selectedSkuSet.has(group.internalSku)}
                 scarcityPending={scarcityPendingSku === group.internalSku}
                 stagedRetailUsd={stagedPriceUpdates[group.internalSku]}
                 onCommitOverride={onCommitOverride}
                 onLogisticsChange={onLogisticsChange}
                 onToggle={() => toggleSku(group.internalSku)}
                 onToggleScarcity={onToggleScarcity}
+                onToggleSkuSelection={toggleSkuSelection}
               />
             );
           })
@@ -236,23 +265,28 @@ export function MarginGrid({
 }
 
 function SkuExpandableRows({
+  catalogFxRate,
   committingKey,
   currencyMode,
   currentFxRate,
   group,
   isExpanded,
+  isSelected,
   onCommitOverride,
   onLogisticsChange,
   onToggle,
   onToggleScarcity,
+  onToggleSkuSelection,
   scarcityPending,
   stagedRetailUsd,
 }: {
+  catalogFxRate: number;
   committingKey: string | null;
   currencyMode: CurrencyMode;
   currentFxRate: number;
   group: PricedSku;
   isExpanded: boolean;
+  isSelected: boolean;
   onCommitOverride: (group: PricedSku, supplier: SupplierTlc) => void;
   onLogisticsChange: (
     internalSku: string,
@@ -262,6 +296,7 @@ function SkuExpandableRows({
   ) => void;
   onToggle: () => void;
   onToggleScarcity: (sku: CommandCenterSku, isActive: boolean) => void;
+  onToggleSkuSelection: (internalSku: string) => void;
   scarcityPending: boolean;
   stagedRetailUsd?: number;
 }) {
@@ -271,13 +306,15 @@ function SkuExpandableRows({
   const displayRetailUsd = isStaged ? stagedRetailUsd : group.retailPriceUsd;
   const displayLiveRetailZmw = calculateLiveRetailZmw(
     displayRetailUsd,
-    currentFxRate,
+    catalogFxRate,
   );
+  const bestTlcZmw = group.bestTlcUsd * currentFxRate;
   const displayLiveRetail =
     currencyMode === "ZMW" ? displayLiveRetailZmw : displayRetailUsd;
-  const displayMarginPct = isStaged
-    ? calculateCurrentMarginPct(displayLiveRetailZmw, group.bestTlc)
-    : group.currentMarginPct;
+  const displayMarginPct = calculateCurrentMarginPct(
+    displayLiveRetailZmw,
+    bestTlcZmw,
+  );
   const displayTargetCost = toDisplayCurrency(
     group.targetCostUsd,
     currencyMode,
@@ -288,11 +325,8 @@ function SkuExpandableRows({
     currencyMode,
     currentFxRate,
   );
-  const displayBestTlc = tlcToDisplayCurrency(
-    group.bestTlc,
-    currencyMode,
-    currentFxRate,
-  );
+  const displayBestTlc =
+    currencyMode === "ZMW" ? bestTlcZmw : group.bestTlcUsd;
 
   return (
     <>
@@ -302,6 +336,7 @@ function SkuExpandableRows({
           isStaged && "bg-blue-500/10 hover:bg-blue-500/15",
         )}
         aria-expanded={isExpanded}
+        data-state={isSelected ? "selected" : undefined}
         onClick={onToggle}
         onKeyDown={(event) => {
           if (event.key === "Enter" || event.key === " ") {
@@ -311,6 +346,17 @@ function SkuExpandableRows({
         }}
         tabIndex={0}
       >
+        <TableCell
+          className="w-10"
+          onClick={(event) => event.stopPropagation()}
+          onKeyDown={(event) => event.stopPropagation()}
+        >
+          <Checkbox
+            checked={isSelected}
+            aria-label={`Select ${group.internalSku}`}
+            onCheckedChange={() => onToggleSkuSelection(group.internalSku)}
+          />
+        </TableCell>
         <TableCell className="w-10">
           {isExpanded ? (
             <ChevronDown className="size-4 text-muted-foreground" />
@@ -394,7 +440,7 @@ function SkuExpandableRows({
       </TableRow>
       {isExpanded ? (
         <TableRow className="hover:bg-transparent">
-          <TableCell colSpan={16} className="bg-muted/30 p-0 whitespace-normal">
+          <TableCell colSpan={17} className="bg-muted/30 p-0 whitespace-normal">
             <div className="px-4 py-3">
               <p className="mb-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
                 SKU cross-analysis · {group.internalSku}
@@ -413,7 +459,9 @@ function SkuExpandableRows({
                 </TableHeader>
                 <TableBody>
                   {group.suppliers.map((supplier) => {
-                    const isBest = supplier.tlcZmw === group.bestTlc;
+                    const isBest =
+                      group.bestSupplier?.supplierName ===
+                      supplier.supplierName;
                     const commitKey = `${group.internalSku}::${supplier.supplierName}`;
 
                     return (
